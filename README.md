@@ -5,7 +5,7 @@ EN:
 !!These tools were created with the help of A.I. For testing purposes, but they turned out to be fully functional =)
 Of course, after conversion, final polishing will be needed, since some samples are in the wrong key; for example, C-4 is used, but they should be in C#4. This can be fixed using OpenMPT.
 
-The converters are quite good, and the samples in spc and nsf turned out well, but I couldn't get the samples in vgm right.
+The converters are pretty good, SPC and NSF have very good converters/generators for samples, but I couldn't get good quality samples in VGM.
 
 python3 spc2xm-midi2.py --transpose -12 --clean-samples --compact 4 --midi 03\ Abobo.spc
 python3 vgm2xm-midi3.py --compact 4 --midi 04\ -\ On\ da\ Ship\'s\ Tail\ (Stage\ 1\).vgm
@@ -100,7 +100,7 @@ python nsf2xm.py *.nsf --all-tracks --midi
 !! Данные инструменты были созданы с помощью и.и. для теста возможностей, но вплоне оказались рабочими =)
 Конечно после конвертации нужна будет финальная полировка, так как некоторые сэмплы не в той тональности к примеру  ставится C-4 но должны быть в C#4, правится через OpenMPT
 
-Весьма годный преобразователи и по семплам вышли у spc и nsf, в vgm сэмплы не получилось довести до ума..
+Конвертеры довольно неплохие, у SPC и NSF есть очень хорошие конвертеры/генераторы для сэмплов, но мне не удалось получить сэмплы хорошего качества в VGM.
 
 python3 spc2xm-midi2.py --transpose -12  --clean-samples --compact 4 --midi 03\ Abobo.spc
 python3 vgm2xm-midi3.py  --compact 4  --midi 04\ -\ On\ da\ Ship\'s\ Tail\ \(Stage\ 1\).vgm 
