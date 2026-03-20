@@ -6,10 +6,11 @@ EN:
 Of course, after conversion, final polishing will be needed, since some samples are in the wrong key; for example, C-4 is used, but they should be in C#4. This can be fixed using OpenMPT.
 
 The converters are pretty good, SPC and NSF have very good converters/generators for samples, but I couldn't get good quality samples in VGM.
-
+```bash
 python3 spc2xm-midi2.py --transpose -12 --clean-samples --compact 4 --midi 03\ Abobo.spc
 python3 vgm2xm-midi3.py --compact 4 --midi 04\ -\ On\ da\ Ship\'s\ Tail\ (Stage\ 1\).vgm
 python3 nsf2xm-midi2.py --track 7 --midi Battletoads\ &\ Double\ Dragon\ -\ The\Ultimate\Team\(1993-06\)\(Rare\)\(Tradewest\).nsf
+```
 
 # Using SPC to XM / MIDI
 ```bash
@@ -102,9 +103,11 @@ python nsf2xm.py *.nsf --all-tracks --midi
 
 Конвертеры довольно неплохие, у SPC и NSF есть очень хорошие конвертеры/генераторы для сэмплов, но мне не удалось получить сэмплы хорошего качества в VGM.
 
+```bash
 python3 spc2xm-midi2.py --transpose -12  --clean-samples --compact 4 --midi 03\ Abobo.spc
 python3 vgm2xm-midi3.py  --compact 4  --midi 04\ -\ On\ da\ Ship\'s\ Tail\ \(Stage\ 1\).vgm 
 python3 nsf2xm-midi2.py --track 7 --midi Battletoads\ \&\ Double\ Dragon\ -\ The\ Ultimate\ Team\ \(1993-06\)\(Rare\)\(Tradewest\).nsf
+```
 
 # Использование SPC to XM / MIDI
 ```bash
