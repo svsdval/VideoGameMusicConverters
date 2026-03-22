@@ -19,7 +19,7 @@ python3 pt32xm-midi-wav.py BlEd.\!m.pt3  --wav  --wav-file output.wav
 
 # Using SPC to XM / MIDI
 ```bash
-# 1 octave higher (your case)
+# 1 octave higher
 python spc2xm.py music.spc --octave 1
 
 # 2 octaves higher
@@ -165,7 +165,7 @@ python3 nsf2xm-midi2.py --track 7 --midi Battletoads\ \&\ Double\ Dragon\ -\ The
 
 # Использование SPC в XM / MIDI
 ```bash
-# На 1 октаву выше (ваш случай)
+# На 1 октаву выше
 python spc2xm.py music.spc --octave 1
 
 # На 2 октавы выше
