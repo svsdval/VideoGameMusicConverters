@@ -1,5 +1,5 @@
 # VideoGameMusicConverters
-Python utils to convert spc to xm, spc to midi, vgm to xm, vgm to midi, nsf to xm , nsf to midi
+Python utils to convert spc to xm, spc to midi, vgm to xm, vgm to midi, nsf to xm , nsf to midi, psg to xm , psg to midi
 
 EN:
 !!These tools were created with the help of A.I. For testing purposes, but they turned out to be fully functional =)
@@ -231,3 +231,4 @@ python psg2xm.py music.psg --channel-map "A:tone=0,A:buzz=6,B:tone=1,C:tone=2"
 # Посмотреть все пресеты
 python psg2xm.py --list-presets 
 ```
+1
