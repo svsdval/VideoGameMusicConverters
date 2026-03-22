@@ -10,7 +10,9 @@ The converters are pretty good, SPC and NSF have very good converters/generators
 python3 spc2xm-midi2.py --transpose -12 --clean-samples --compact 4 --midi 03\ Abobo.spc
 python3 vgm2xm-midi3.py --compact 4 --midi 04\ -\ On\ da\ Ship\'s\ Tail\ (Stage\ 1\).vgm
 python3 nsf2xm-midi2.py --track 7 --midi Battletoads\ &\ Double\ Dragon\ -\ The\Ultimate\Team\(1993-06\)\(Rare\)\(Tradewest\).nsf
+python3 psg2xm_split_channels.py BlEd.\!m.psg --midi --channel-map split-all
 ```
+
 
 # Using SPC to XM / MIDI
 ```bash
@@ -96,6 +98,25 @@ python nsf2xm.py game.nsf --track 3 --octave 1 --compact 2 --duration 60
 python nsf2xm.py *.nsf --all-tracks --midi
 ```
 
+# Using PSG to XM/MIDI
+```bash
+# Default: Buzzer on separate channels 3-5
+python psg2xm.py music.psg --midi
+
+# Compact in 4 channels
+python psg2xm.py music.psg --channel-map compact
+
+# Maximum split
+python psg2xm.py music.psg --channel-map split-all
+
+# Custom mapping: Channel A buzzer to XM channel 6
+python psg2xm.py music.psg --channel-map "A:tone=0,A:buzz=6,B:tone=1,C:tone=2"
+
+# View all presets
+python psg2xm.py --list-presets
+```
+
+
 # RU:
 
 !! Данные инструменты были созданы с помощью и.и. для теста возможностей, но вплоне оказались рабочими =)
@@ -109,7 +130,7 @@ python3 vgm2xm-midi3.py  --compact 4  --midi 04\ -\ On\ da\ Ship\'s\ Tail\ \(Sta
 python3 nsf2xm-midi2.py --track 7 --midi Battletoads\ \&\ Double\ Dragon\ -\ The\ Ultimate\ Team\ \(1993-06\)\(Rare\)\(Tradewest\).nsf
 ```
 
-# Использование SPC to XM / MIDI
+# Использование SPC в XM / MIDI
 ```bash
 # На 1 октаву выше (ваш случай)
 python spc2xm.py music.spc --octave 1
@@ -139,7 +160,7 @@ python spc2xm.py music.spc --compact 4
 python spc2xm.py music.spc --octave 1 --bpm 140 --duration 180 --compact 4
 
 ```
-# Использование VGM to XM / MIDI
+# Использование VGM в XM / MIDI
 ```bash
 # Только XM
 python vgm2xm.py music.vgm
@@ -167,7 +188,7 @@ python vgm2xm.py *.vgm --midi --compact 2
 python vgm2xm.py *.vgz --midi-only
 ```
 
-# Использование NSF to XM / MIDI
+# Использование NSF в XM / MIDI
 ```bash
 # Трек по умолчанию
 python nsf2xm.py game.nsf
@@ -193,3 +214,20 @@ python nsf2xm.py game.nsf --track 3 --octave 1 --compact 2 --duration 60
 python nsf2xm.py *.nsf --all-tracks --midi
 ```
 
+# Использование PSG в XM / MID
+```bash
+# По умолчанию: buzzer на отдельных каналах 3-5
+python psg2xm.py music.psg --midi
+
+# Компактно в 4 канала
+python psg2xm.py music.psg --channel-map compact
+
+# Максимальное разделение
+python psg2xm.py music.psg --channel-map split-all
+
+# Свой маппинг: buzzer канала A на XM канал 6
+python psg2xm.py music.psg --channel-map "A:tone=0,A:buzz=6,B:tone=1,C:tone=2"
+
+# Посмотреть все пресеты
+python psg2xm.py --list-presets 
+```
