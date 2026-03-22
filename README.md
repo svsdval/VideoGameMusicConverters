@@ -1,5 +1,5 @@
 # VideoGameMusicConverters
-Python utils to convert spc to xm, spc to midi, vgm to xm, vgm to midi, nsf to xm , nsf to midi, psg to xm , psg to midi
+Python utils to convert spc to xm, spc to midi, vgm to xm, vgm to midi, nsf to xm , nsf to midi, psg to xm , psg to midi, pt3 to xm, pt3 to midi, pt3 to wav
 
 EN:
 !!These tools were created with the help of A.I. For testing purposes, but they turned out to be fully functional =)
@@ -11,6 +11,9 @@ python3 spc2xm-midi2.py --transpose -12 --clean-samples --compact 4 --midi 03\ A
 python3 vgm2xm-midi3.py --compact 4 --midi 04\ -\ On\ da\ Ship\'s\ Tail\ (Stage\ 1\).vgm
 python3 nsf2xm-midi2.py --track 7 --midi Battletoads\ &\ Double\ Dragon\ -\ The\Ultimate\Team\(1993-06\)\(Rare\)\(Tradewest\).nsf
 python3 psg2xm_split_channels.py BlEd.\!m.psg --midi --channel-map split-all
+python3 pt32xm-midi-wav.py BlEd.\!m.pt3  --midi  --channel-map split-all --raw-notes
+python3 pt32xm-midi-wav.py BlEd.\!m.pt3  --midi  --channel-map split-all
+python3 pt32xm-midi-wav.py BlEd.\!m.pt3  --wav  --wav-file output.wav
 ```
 
 
@@ -114,6 +117,36 @@ python psg2xm.py music.psg --channel-map "A:tone=0,A:buzz=6,B:tone=1,C:tone=2"
 
 # View all presets
 python psg2xm.py --list-presets
+```
+
+# USING PT3 to XM / MID / WAV
+```bash
+# WAV only
+python pt32xm.py music.pt3 --wav
+
+# WAV with YM chip and high sample rate
+python pt32xm.py music.pt3 --wav --ym --sample-rate 48000
+
+# All at once: XM + MIDI + WAV
+python pt32xm.py music.pt3 --all
+
+# Compact in 4 channels
+python pt32xm.py music.pt3 --channel-map compact
+
+# Maximum split
+python pt32xm.py music.pt3 --channel-map split-all
+
+# WAV + raw notes to MIDI
+python pt32xm.py music.pt3 --wav --raw-notes --midi
+
+# WAV to a specific file
+python pt32xm.py music.pt3 --wav-file output.wav
+
+# Silent WAV
+python pt32xm.py music.pt3 --wav --wav-volume 0.5
+
+# Batch processing
+python pt32xm.py *.pt3 --wav --midi
 ```
 
 
@@ -231,4 +264,33 @@ python psg2xm.py music.psg --channel-map "A:tone=0,A:buzz=6,B:tone=1,C:tone=2"
 # Посмотреть все пресеты
 python psg2xm.py --list-presets 
 ```
-1
+
+# Использование pt3 в XM / MID / WAV
+```bash
+# Только WAV
+python pt32xm.py music.pt3 --wav
+
+# WAV с YM-чипом и высоким sample rate
+python pt32xm.py music.pt3 --wav --ym --sample-rate 48000
+
+# Всё сразу: XM + MIDI + WAV
+python pt32xm.py music.pt3 --all
+
+# Компактно в 4 канала
+python pt32xm.py music.pt3 --channel-map compact
+
+# Максимальное разделение
+python pt32xm.py music.pt3 --channel-map split-all
+
+# WAV + raw ноты в MIDI
+python pt32xm.py music.pt3 --wav --raw-notes --midi
+
+# WAV в конкретный файл
+python pt32xm.py music.pt3 --wav-file output.wav
+
+# Тихий WAV
+python pt32xm.py music.pt3 --wav --wav-volume 0.5
+
+# Пакетная обработка
+python pt32xm.py *.pt3 --wav --midi
+```
