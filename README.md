@@ -8,12 +8,19 @@ Of course, after conversion, final polishing will be needed, since some samples 
 The converters are pretty good, SPC and NSF have very good converters/generators for samples, but I couldn't get good quality samples in VGM.
 ```bash
 python3 spc2xm-midi2.py --transpose -12 --clean-samples --compact 4 --midi 03\ Abobo.spc
+
 python3 vgm2xm-midi3.py --compact 4 --midi 04\ -\ On\ da\ Ship\'s\ Tail\ (Stage\ 1\).vgm
+
 python3 nsf2xm-midi2.py --track 7 --midi Battletoads\ &\ Double\ Dragon\ -\ The\Ultimate\Team\(1993-06\)\(Rare\)\(Tradewest\).nsf
+
 python3 psg2xm_split_channels.py BlEd.\!m.psg --midi --channel-map split-all
+
 python3 pt32xm-midi-wav.py BlEd.\!m.pt3  --midi  --channel-map split-all --raw-notes
 python3 pt32xm-midi-wav.py BlEd.\!m.pt3  --midi  --channel-map split-all
 python3 pt32xm-midi-wav.py BlEd.\!m.pt3  --wav  --wav-file output.wav
+
+python3 sid2xm-midi-wav.py Devils_ReSIDence_3SID.sid --midi --seconds 335
+python3 sid2xm-midi-wav.py Devils_ReSIDence_3SID.sid --all --seconds 335
 ```
 
 
@@ -159,8 +166,20 @@ python pt32xm.py *.pt3 --wav --midi
 
 ```bash
 python3 spc2xm-midi2.py --transpose -12  --clean-samples --compact 4 --midi 03\ Abobo.spc
+
 python3 vgm2xm-midi3.py  --compact 4  --midi 04\ -\ On\ da\ Ship\'s\ Tail\ \(Stage\ 1\).vgm 
+
 python3 nsf2xm-midi2.py --track 7 --midi Battletoads\ \&\ Double\ Dragon\ -\ The\ Ultimate\ Team\ \(1993-06\)\(Rare\)\(Tradewest\).nsf
+
+python3 psg2xm_split_channels.py BlEd.\!m.psg --midi --channel-map split-all
+
+python3 pt32xm-midi-wav.py BlEd.\!m.pt3  --midi  --channel-map split-all --raw-notes
+python3 pt32xm-midi-wav.py BlEd.\!m.pt3  --midi  --channel-map split-all
+python3 pt32xm-midi-wav.py BlEd.\!m.pt3  --wav  --wav-file output.wav
+
+python3 sid2xm-midi-wav.py Devils_ReSIDence_3SID.sid --midi --seconds 335
+python3 sid2xm-midi-wav.py Devils_ReSIDence_3SID.sid --all --seconds 335
+
 ```
 
 # Использование SPC в XM / MIDI
