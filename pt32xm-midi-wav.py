@@ -5,6 +5,7 @@ With channel mapping, --raw-notes mode, and WAV rendering
 """
 
 import struct, sys, os, math, array
+import numpy as np
 from dataclasses import dataclass, field
 from typing import List, Dict, Tuple, Optional
 
@@ -156,211 +157,139 @@ YM_DAC = [
     0.333730067903,0.400427252613,0.467383840696,0.53443198291,
     0.635172045472,0.75800717174,0.879926756695,1.0]
 
-# Envelope state machines
-ENV_SHAPES = {
-    # shape: [(segment0_dir, segment0_hold), (segment1_dir, segment1_hold)]
-    # dir: 1=up, -1=down, hold: None=continue, 0=hold_bottom, 31=hold_top
-}
+def _lfsr_sequence():
+    """One full period of the AY noise LFSR (17 bit, taps 0 and 3), output bit = bit 0."""
+    n = 1
+    out = bytearray(131071)
+    for i in range(131071):
+        bit = (n ^ (n >> 3)) & 1
+        n = (n >> 1) | (bit << 16)
+        out[i] = n & 1
+    return out
+
+_LFSR = None
+
+def get_lfsr():
+    global _LFSR
+    if _LFSR is None:
+        _LFSR = np.frombuffer(_lfsr_sequence(), dtype=np.uint8)
+    return _LFSR
+
+def env_level(shape, s):
+    """Envelope level 0..31 after s envelope steps since the shape was written (vectorised)."""
+    seg = s // 32
+    pos = s % 32
+    if not shape & 8:
+        up = bool(shape & 4)
+        return np.where(seg == 0, pos if up else 31 - pos, 0)
+    up = bool(shape & 4)
+    alt = bool(shape & 2)
+    hold = bool(shape & 1)
+    if hold:
+        final = 31 if (up != alt) else 0
+        first = pos if up else 31 - pos
+        return np.where(seg == 0, first, final)
+    up_seg = np.logical_xor(up, np.logical_and(alt, (seg & 1) == 1))
+    return np.where(up_seg, pos, 31 - pos)
+
 
 class AYEmulator:
-    """Simple AY-3-8910 emulator for WAV rendering."""
-    def __init__(self, clock_rate=1773400, sample_rate=44100, is_ym=False):
+    """AY-3-8910 / YM2149 emulator (numpy, one PT3 frame at a time).
+
+    The chip is stepped at clock/8 (tone and noise dividers are exact), the
+    result is averaged over every output sample (box filter).
+    """
+    # (left, right) gains of channels A, B, C
+    PAN = {'abc': ((0.95, 0.27), (0.65, 0.62), (0.62, 1.03)),   # fitted to zxtune123 (ABC)
+           'mono': ((0.7, 0.7), (0.7, 0.7), (0.7, 0.7))}
+
+    def __init__(self, clock_rate=1773400, sample_rate=44100, is_ym=False, fps=50.0,
+                 layout='abc'):
+        get_lfsr()
         self.clock = clock_rate
         self.sr = sample_rate
-        self.dac = YM_DAC if is_ym else AY_DAC
-        self.step = clock_rate / (sample_rate * 8 * 8)
-        # Tone
-        self.tone_period = [1,1,1]
-        self.tone_counter = [0,0,0]
-        self.tone_out = [0,0,0]
-        # Noise
-        self.noise_period = 1
-        self.noise_counter = 0
-        self.noise = 1
-        self.noise_out = 0
-        # Envelope
-        self.env_period = 1
-        self.env_counter = 0
-        self.env_shape = 0
-        self.env_segment = 0
-        self.env_value = 0
-        # Mixer
-        self.tone_off = [1,1,1]   # 1=disabled
-        self.noise_off = [1,1,1]
-        self.env_on = [0,0,0]
-        self.volume = [0,0,0]
-        # Pan
-        self.pan_l = [0.9,0.5,0.1]
-        self.pan_r = [0.1,0.5,0.9]
-        # Interpolation
-        self.x = 0.0
+        self.dac = np.array(YM_DAC if is_ym else AY_DAC)
+        self.tick_rate = clock_rate / 8.0
+        self.ticks_per_frame = self.tick_rate / fps
+        self.samples_per_frame = sample_rate / fps
+        self.pan = np.array(self.PAN[layout])        # 3 x 2
+        self.tcnt = [0, 0, 0]
+        self.tout = [0, 0, 0]
+        self.ncnt = 0
+        self.nidx = 0
+        self.ecnt = 0
+        self.estep = 0
+        self.eshape = 0
+        self.tick_pos = 0.0           # fractional tick position carried between frames
+        self.sample_pos = 0.0
+        self.regs = [0] * 14
+        self.chan_rms = [0.0, 0.0, 0.0]   # AC rms of each channel in the last frame
 
     def set_registers(self, regs):
-        """Set all 14 AY registers from array."""
-        self.tone_period[0] = max(1, (regs[1] & 0x0F) << 8 | regs[0])
-        self.tone_period[1] = max(1, (regs[3] & 0x0F) << 8 | regs[2])
-        self.tone_period[2] = max(1, (regs[5] & 0x0F) << 8 | regs[4])
-        self.noise_period = max(1, regs[6] & 0x1F)
-        mixer = regs[7]
+        self.regs = list(regs)
+        if regs[13] != 0xFF:
+            self.eshape = regs[13] & 0x0F
+            self.ecnt = 0
+            self.estep = 0
+
+    def render_frame(self):
+        """Render one frame with the current registers -> (n, 2) float array."""
+        r = self.regs
+        t0 = self.tick_pos
+        t1 = t0 + self.ticks_per_frame
+        n = int(t1) - int(t0)
+        self.tick_pos = t1
+        k = np.arange(1, n + 1, dtype=np.int64)
+        mixer = r[7]
+        noise_p = max(1, r[6] & 0x1F) * 2
+        c = self.ncnt + k
+        shifts = c // noise_p
+        noise = _LFSR[(self.nidx + shifts) % len(_LFSR)]
+        self.nidx = int((self.nidx + (self.ncnt + n) // noise_p) % len(_LFSR))
+        self.ncnt = int((self.ncnt + n) % noise_p)
+        ep = max(1, (r[12] << 8) | r[11])
+        steps = (self.ecnt + k) // ep
+        env = env_level(self.eshape, self.estep + steps)
+        tot = self.ecnt + n
+        self.estep = min(self.estep + tot // ep, 1 << 20)
+        self.ecnt = int(tot % ep)
+        out = np.zeros((n, 2))
         for i in range(3):
-            self.tone_off[i] = (mixer >> i) & 1
-            self.noise_off[i] = (mixer >> (i+3)) & 1
-            self.env_on[i] = 1 if regs[8+i] & 0x10 else 0
-            self.volume[i] = regs[8+i] & 0x0F
-        self.env_period = max(1, regs[12] << 8 | regs[11])
-        if regs[13] != 0xFF and regs[13] != 255:
-            self.env_shape = regs[13] & 0x0F
-            self.env_counter = 0
-            self.env_segment = 0
-            self._reset_env_segment()
-
-    def _reset_env_segment(self):
-        shape = self.env_shape
-        seg = self.env_segment
-        # Determine initial value based on shape and segment
-        if shape < 4:  # \___
-            self.env_value = 31 if seg == 0 else 0
-        elif shape < 8:  # /___
-            self.env_value = 0 if seg == 0 else 0
-        elif shape == 8:  # \\\\
-            self.env_value = 31
-        elif shape == 9:  # \___
-            self.env_value = 31 if seg == 0 else 0
-        elif shape == 10:  # \/\/
-            self.env_value = 31 if seg % 2 == 0 else 0
-        elif shape == 11:  # \---
-            self.env_value = 31 if seg == 0 else 31
-        elif shape == 12:  # ////
-            self.env_value = 0
-        elif shape == 13:  # /---
-            self.env_value = 0 if seg == 0 else 31
-        elif shape == 14:  # /\/\  
-            self.env_value = 0 if seg % 2 == 0 else 31
-        elif shape == 15:  # /___
-            self.env_value = 0 if seg == 0 else 0
-
-    def _update_tone(self, ch):
-        self.tone_counter[ch] += 1
-        if self.tone_counter[ch] >= self.tone_period[ch]:
-            self.tone_counter[ch] = 0
-            self.tone_out[ch] ^= 1
-        return self.tone_out[ch]
-
-    def _update_noise(self):
-        self.noise_counter += 1
-        if self.noise_counter >= self.noise_period * 2:
-            self.noise_counter = 0
-            bit = ((self.noise ^ (self.noise >> 3)) & 1)
-            self.noise = (self.noise >> 1) | (bit << 16)
-        self.noise_out = self.noise & 1
-        return self.noise_out
-
-    def _update_envelope(self):
-        self.env_counter += 1
-        if self.env_counter >= self.env_period:
-            self.env_counter = 0
-            shape = self.env_shape
-            seg = self.env_segment
-            if shape < 4:  # \___
-                if seg == 0:
-                    self.env_value -= 1
-                    if self.env_value < 0:
-                        self.env_segment = 1
-                        self.env_value = 0
-            elif shape < 8:  # /___
-                if seg == 0:
-                    self.env_value += 1
-                    if self.env_value > 31:
-                        self.env_segment = 1
-                        self.env_value = 0
-            elif shape == 8:  # \\\\
-                self.env_value -= 1
-                if self.env_value < 0:
-                    self.env_value = 31
-            elif shape == 9:  # \___
-                if seg == 0:
-                    self.env_value -= 1
-                    if self.env_value < 0:
-                        self.env_segment = 1
-                        self.env_value = 0
-            elif shape == 10:  # \/\/
-                if seg % 2 == 0:
-                    self.env_value -= 1
-                    if self.env_value < 0:
-                        self.env_segment += 1
-                        self.env_value = 0
-                else:
-                    self.env_value += 1
-                    if self.env_value > 31:
-                        self.env_segment += 1
-                        self.env_value = 31
-            elif shape == 11:  # \---
-                if seg == 0:
-                    self.env_value -= 1
-                    if self.env_value < 0:
-                        self.env_segment = 1
-                        self.env_value = 31
-            elif shape == 12:  # ////
-                self.env_value += 1
-                if self.env_value > 31:
-                    self.env_value = 0
-            elif shape == 13:  # /---
-                if seg == 0:
-                    self.env_value += 1
-                    if self.env_value > 31:
-                        self.env_segment = 1
-                        self.env_value = 31
-            elif shape == 14:  # /\/\ 
-                if seg % 2 == 0:
-                    self.env_value += 1
-                    if self.env_value > 31:
-                        self.env_segment += 1
-                        self.env_value = 31
-                else:
-                    self.env_value -= 1
-                    if self.env_value < 0:
-                        self.env_segment += 1
-                        self.env_value = 0
-            elif shape == 15:  # /___
-                if seg == 0:
-                    self.env_value += 1
-                    if self.env_value > 31:
-                        self.env_segment = 1
-                        self.env_value = 0
-        return self.env_value
-
-    def _mix_sample(self):
-        noise = self._update_noise()
-        envelope = self._update_envelope()
-        left = 0.0; right = 0.0
-        for i in range(3):
-            tone = self._update_tone(i)
-            out = (tone | self.tone_off[i]) & (noise | self.noise_off[i])
-            if self.env_on[i]:
-                amp = envelope
+            p = max(1, ((r[i * 2 + 1] & 0x0F) << 8) | r[i * 2])
+            cnt = min(self.tcnt[i], p - 1)
+            cc = cnt + k
+            tone = np.bitwise_xor(self.tout[i], (cc // p) & 1)
+            self.tout[i] = int(tone[-1]) if n else self.tout[i]
+            self.tcnt[i] = int(cc[-1] % p) if n else cnt
+            t_dis = (mixer >> i) & 1
+            n_dis = (mixer >> (i + 3)) & 1
+            gate = np.logical_or(tone, t_dis) & np.logical_or(noise, n_dis)
+            va = r[8 + i]
+            if va & 0x10:
+                lvl = env
             else:
-                amp = self.volume[i] * 2 + 1
-            val = self.dac[out * amp] if out * amp < len(self.dac) else 0
-            left += val * self.pan_l[i]
-            right += val * self.pan_r[i]
-        return left, right
-
-    def render_sample(self):
-        """Render one output sample (at sample_rate)."""
-        left = 0.0; right = 0.0
-        for _ in range(8):  # decimation factor
-            self.x += self.step
-            if self.x >= 1.0:
-                self.x -= 1.0
-                self._last_l, self._last_r = self._mix_sample()
-            left += getattr(self, '_last_l', 0)
-            right += getattr(self, '_last_r', 0)
-        return left / 8, right / 8
+                lvl = (va & 0x0F) * 2 + 1
+            v = self.dac[np.where(gate, lvl, 0)] if va & 0x10 else self.dac[lvl] * gate
+            self.chan_rms[i] = float(v.std()) if n else 0.0
+            out += v[:, None] * self.pan[i][None, :]
+        # box-average ticks into output samples
+        s0 = self.sample_pos
+        s1 = s0 + self.samples_per_frame
+        ns = int(s1) - int(s0)
+        self.sample_pos = s1
+        cs = np.concatenate(([[0.0, 0.0]], np.cumsum(out, axis=0)))
+        edges = np.round(np.arange(ns + 1) * (n / max(1, ns))).astype(np.int64)
+        edges = np.clip(edges, 0, n)
+        cnts = np.maximum(1, np.diff(edges))[:, None]
+        return (cs[edges[1:]] - cs[edges[:-1]]) / cnts
 
 
 # ═══════════════════════════════════════════════════════════════
 # PT3 Player (faithful port of pt3player.c)
 # ═══════════════════════════════════════════════════════════════
+
+# PT 3.3/3.4 volume table: amp*step>>8 (steps fitted against zxtune123 register dumps; v<5 extrapolated)
+VT34_STEP = [0,18,36,54,72,94,111,132,145,161,174,194,207,225,247,256]
 
 @dataclass
 class ChannelState:
@@ -538,7 +467,7 @@ class PT3Player:
             ch.amplitude+=ch.cur_amp_slide
             if ch.amplitude<0:ch.amplitude=0
             elif ch.amplitude>15:ch.amplitude=15
-            ch.amplitude=(ch.volume*ch.amplitude+8)//15
+            ch.amplitude=((ch.amplitude*VT34_STEP[ch.volume])>>8) if self.version<=4 else (ch.volume*ch.amplitude+8)//15
             if not(b0&1)and ch.env_enabled:ch.amplitude|=0x10
             if b1&0x80:
                 if b0&0x20:j2=((b0>>1)|0xF0)+ch.cur_env_slide
@@ -597,384 +526,456 @@ class PT3Player:
 # WAV Renderer
 # ═══════════════════════════════════════════════════════════════
 
-def render_wav(player, filename, sample_rate=44100, clock_rate=1773400,
-               is_ym=False, stereo=True, volume=0.8, max_frames=50000):
-    """Render PT3 to WAV using AY emulator."""
-    frame_rate = 50
-    samples_per_frame = sample_rate // frame_rate
-
-    ay = AYEmulator(clock_rate, sample_rate, is_ym)
-
-    # Re-init player
-    player._init_playback()
-
-    pcm_l = []
-    pcm_r = []
-    total_samples = 0
-
-    print(f"  Rendering WAV: {sample_rate}Hz, {'stereo' if stereo else 'mono'}, "
-          f"{'YM' if is_ym else 'AY'} chip...")
-
+def pt3_frames(player, max_frames=50000):
+    """Run the PT3 player: yields (registers, note_started[3]) once per 50 Hz frame."""
     for frame in range(max_frames):
         regs = player.play_tick()
+        yield regs, [player.channels[i].note_changed for i in range(3)]
+        if player_finished(player, frame): break
+
+def render_wav(regs_frames, filename, sample_rate=44100, clock_rate=1773400,
+               is_ym=False, stereo=True, volume=0.8, fps=50.0, layout='abc'):
+    """Render register frames (iterable of 14 register values per frame) to WAV."""
+    ay = AYEmulator(clock_rate, sample_rate, is_ym, fps, layout)
+    chunks = []
+    print(f"  Rendering WAV: {sample_rate}Hz, {'stereo' if stereo else 'mono'}, "
+          f"{'YM' if is_ym else 'AY'} chip, {clock_rate} Hz, {fps:g} fps...")
+    for regs in regs_frames:
         ay.set_registers(regs)
-
-        for _ in range(samples_per_frame):
-            l, r = ay.render_sample()
-            pcm_l.append(l)
-            pcm_r.append(r)
-            total_samples += 1
-
-        # Stop check
-        if (player.state.current_position >= player.num_positions - 1 and
-            player.state.delay_counter == 1 and
-            player.channels[0].skip_counter == 1 and frame > 100):
-            if player._b(player.channels[0].address) == 0:
-                break
-
-        if frame % 500 == 0 and frame > 0:
-            print(f"    frame {frame}/{max_frames} "
-                  f"({total_samples/sample_rate:.1f}s)...", end='\r')
-
-    print(f"    Rendered {total_samples} samples "
-          f"({total_samples/sample_rate:.1f}s)        ")
-
-    # Normalize & write WAV
-    max_val = 0
-    for i in range(len(pcm_l)):
-        max_val = max(max_val, abs(pcm_l[i]), abs(pcm_r[i]))
-    if max_val == 0:
-        max_val = 1
-
-    scale = volume * 32767 / max_val
-    nch = 2 if stereo else 1
-
+        chunks.append(ay.render_frame())
+    pcm = np.concatenate(chunks)
+    # the DAC is unipolar: volume changes leave slow DC steps. Real players remove
+    # them with a high-pass; a zero-phase 1st order 20 Hz filter (in the spectrum) does the same
+    spec = np.fft.rfft(pcm, axis=0)
+    fr = np.fft.rfftfreq(len(pcm), 1.0 / sample_rate)
+    spec *= (fr / np.sqrt(fr * fr + 20.0 ** 2))[:, None]
+    pcm = np.fft.irfft(spec, n=len(pcm), axis=0)
+    peak = float(np.abs(pcm).max()) or 1.0
+    pcm = pcm * (volume / peak)
+    if not stereo:
+        pcm = pcm.mean(axis=1, keepdims=True)
+    data = np.clip(pcm * 32767, -32768, 32767).astype('<i2')
+    nch = data.shape[1]
     with open(filename, 'wb') as f:
-        data_size = total_samples * nch * 2
-        f.write(b'RIFF')
-        f.write(struct.pack('<I', 36 + data_size))
-        f.write(b'WAVE')
-        f.write(b'fmt ')
-        f.write(struct.pack('<I', 16))           # chunk size
-        f.write(struct.pack('<H', 1))            # PCM
-        f.write(struct.pack('<H', nch))          # channels
-        f.write(struct.pack('<I', sample_rate))  # sample rate
-        f.write(struct.pack('<I', sample_rate * nch * 2))  # byte rate
-        f.write(struct.pack('<H', nch * 2))      # block align
-        f.write(struct.pack('<H', 16))           # bits per sample
-        f.write(b'data')
-        f.write(struct.pack('<I', data_size))
-
-        for i in range(total_samples):
-            sl = max(-32768, min(32767, int(pcm_l[i] * scale)))
-            if stereo:
-                sr = max(-32768, min(32767, int(pcm_r[i] * scale)))
-                f.write(struct.pack('<hh', sl, sr))
-            else:
-                f.write(struct.pack('<h', sl))
-
-    return total_samples / sample_rate
+        f.write(b'RIFF' + struct.pack('<I', 36 + data.nbytes) + b'WAVE')
+        f.write(b'fmt ' + struct.pack('<IHHIIHH', 16, 1, nch, sample_rate,
+                                       sample_rate * nch * 2, nch * 2, 16))
+        f.write(b'data' + struct.pack('<I', data.nbytes))
+        f.write(data.tobytes())
+    print(f"    Rendered {len(data)} samples ({len(data)/sample_rate:.1f}s)")
+    return len(data) / sample_rate
 
 # ═══════════════════════════════════════════════════════════════
-# Note extraction (raw & AY modes) — same as v6
+# Instruments (waveforms of the AY itself)
 # ═══════════════════════════════════════════════════════════════
 
-CLOCK=1773400;REPEATING_ENV={0x08,0x0A,0x0C,0x0E}
-def ay_freq(p):return CLOCK/(16.0*p)if p>0 else 0
-def env_freq(p):return CLOCK/(256.0*p)if p>0 else 0
+P_SQ = 0.62          # peak of the square sample (headroom for louder timbres)
+FPS = 50             # PT3 player rate (ZX Spectrum interrupt)
+
+def _pcm(vals, peak):
+    """float list -> int16 list: DC removed, scaled so max |x| = peak."""
+    a = np.array(vals, dtype=float)
+    a = a - a.mean()
+    m = float(np.abs(a).max()) or 1.0
+    return [int(round(x)) for x in a * (peak * 32767.0 / m)]
+
+class AYGen:
+    """Samples for XM instruments: one period of what the chip really outputs."""
+    @staticmethod
+    def build(is_ym=False):
+        dac = YM_DAC if is_ym else AY_DAC
+        lf = _LFSR if _LFSR is not None else np.frombuffer(_lfsr_sequence(), dtype=np.uint8)
+        square = _pcm([1] * 16 + [-1] * 16, P_SQ)
+        saw = _pcm([dac[31 - i] for i in range(32)], 0.95)
+        tri = _pcm([dac[31 - i] for i in range(32)] + [dac[i] for i in range(32)], 0.95)
+        noise = _pcm([int(b) for b in lf[:32768]], P_SQ)
+        mixed = _pcm([float(lf[i * 7 % 4000]) for i in range(32)] + [0.0] * 32, 0.95)
+        def inst(name, data, rel=0, loop=True):
+            rms = float(np.sqrt(np.mean(np.square(data, dtype=float)))) / 32767.0
+            return {'name': name, 'data': data, 'rel': rel, 'loop': loop, 'rms': rms}
+        return [inst('AY Tone', square), inst('AY Env+Tone', square),
+                inst('AY Buzzer saw', saw), inst('AY Tone+Noise', mixed, 12),
+                inst('AY Noise', noise), inst('AY Buzzer tri', tri, 12)]
+
+INST_TONE, INST_ENVTONE, INST_BUZZ, INST_MIXED, INST_NOISE, INST_BUZZ_TRI = 1, 2, 3, 4, 5, 6
+_INST_CACHE = {}
+def instruments(is_ym=False):
+    if is_ym not in _INST_CACHE:
+        _INST_CACHE[is_ym] = AYGen.build(is_ym)
+    return _INST_CACHE[is_ym]
+
+def xm_volume(r, inst, is_ym, scale=1.0):
+    """AC rms of a channel (1.0 = full-level square has 0.5) -> XM volume 1..64."""
+    rms = instruments(is_ym)[inst - 1]['rms']
+    v = 64.0 * r * (2.0 * P_SQ) / rms * scale
+    return max(1, min(64, int(round(v))))
+
+# ═══════════════════════════════════════════════════════════════
+# Note extraction (raw & AY modes)
+# ═══════════════════════════════════════════════════════════════
+
+CLOCK = 1773400
+REPEATING_ENV = {0x08, 0x0A, 0x0C, 0x0E}
+
+def clamp_xm(n):
+    return n if 1 <= n <= 96 else None
+
 def freq_to_xm(freq):
-    if freq<15 or freq>20000:return None
-    midi=69+12*math.log2(freq/440.0);xm=int(round(midi))-11
-    return xm if 1<=xm<=96 else None
+    if freq < 15 or freq > 20000: return None
+    return clamp_xm(int(round(69 + 12 * math.log2(freq / 440.0))) - 11)
+
+def rate_to_xm(rate):
+    """Playback rate (samples/s) of a looped 1-sample-per-step wave -> XM note."""
+    return max(1, min(96, int(round(49 + 12 * math.log2(max(rate, 1.0) / 8363.0)))))
 
 @dataclass
 class NoteEvent:
-    frame:int=0;channel:int=0;ay_channel:int=0;mode:str=""
-    event_type:str="";note:int=0;instrument:int=1;volume:int=64
+    frame: int = 0; channel: int = 0; ay_channel: int = 0; mode: str = ""
+    event_type: str = ""; note: int = 0; instrument: int = 1; volume: int = 64
 
-def extract_notes_raw(player,max_frames=50000):
-    events=[];prev_note=[-1,-1,-1];prev_vol=[0,0,0]
+def extract_notes_raw(player, max_frames=50000):
+    events = []; prev_note = [-1, -1, -1]
     for frame in range(max_frames):
         player.play_tick()
         for ch in range(3):
-            c=player.channels[ch]
+            c = player.channels[ch]
             if c.just_disabled:
-                if prev_note[ch]>=0:events.append(NoteEvent(frame,ch,ch,'','note_off',97));prev_note[ch]=-1
+                if prev_note[ch] >= 0:
+                    events.append(NoteEvent(frame, ch, ch, '', 'note_off', 97)); prev_note[ch] = -1
             elif c.note_changed and c.enabled:
-                if prev_note[ch]>=0:events.append(NoteEvent(frame,ch,ch,'','note_off',97))
-                xn=c.note+1;xv=max(1,int(64*c.volume/15))
-                events.append(NoteEvent(frame,ch,ch,MODE_TONE,'note_on',max(1,min(96,xn)),1,xv))
-                prev_note[ch]=c.note;prev_vol[ch]=xv
-        if(player.state.current_position>=player.num_positions-1 and
-           player.state.delay_counter==1 and player.channels[0].skip_counter==1 and frame>100):
-            if player._b(player.channels[0].address)==0:break
+                xv = max(1, int(64 * c.volume / 15))
+                events.append(NoteEvent(frame, ch, ch, MODE_TONE, 'note_on', max(1, min(96, c.note + 1)), 1, xv))
+                prev_note[ch] = c.note
+        if player_finished(player, frame): break
     for ch in range(3):
-        if prev_note[ch]>=0:events.append(NoteEvent(frame,ch,ch,'','note_off',97))
+        if prev_note[ch] >= 0: events.append(NoteEvent(frame + 1, ch, ch, '', 'note_off', 97))
     return events
 
-def extract_notes_ay(player,channel_map,max_frames=50000):
-    events=[];mx=max(channel_map.values())+1
-    pn=[-1]*mx;pv=[0]*mx;pi=[0]*mx;ps=[True]*mx;pam=[None]*3;pax=[-1]*3
-    def gx(a,m):
-        k=(a,m)
-        if k in channel_map:return channel_map[k]
-        for f in[MODE_TONE,MODE_MIXED,MODE_BUZZER]:
-            if(a,f)in channel_map:return channel_map[(a,f)]
+def player_finished(player, frame):
+    return (player.state.current_position >= player.num_positions - 1 and
+            player.state.delay_counter == 1 and player.channels[0].skip_counter == 1 and
+            frame > 100 and player._b(player.channels[0].address) == 0)
+
+def classify(regs, ac, clock):
+    """What does AY channel `ac` play this frame?  -> (mode, xm_note, instrument) or None."""
+    mixer = regs[7]; vr = regs[8 + ac]
+    tone_on = not (mixer >> ac) & 1
+    noise_on = not (mixer >> (ac + 3)) & 1
+    env_on = bool(vr & 0x10)
+    period = ((regs[ac * 2 + 1] & 0x0F) << 8) | regs[ac * 2]
+    if tone_on:
+        note = freq_to_xm(clock / (16.0 * max(1, period)))
+        if note is None: return None
+        if env_on: return MODE_ENV_TONE, note, INST_ENVTONE
+        if noise_on: return MODE_MIXED, note, INST_MIXED
+        return MODE_TONE, note, INST_TONE
+    if noise_on:
+        np_ = max(1, regs[6] & 0x1F)
+        return MODE_NOISE, rate_to_xm(clock / (16.0 * np_)), INST_NOISE
+    return None   # buzzer (envelope only) is recognised by the caller, it needs the last shape
+
+def extract_notes_ay(frames, channel_map, clock=CLOCK, is_ym=False, scale=1.0):
+    """frames: iterable of (registers, note_started[3]) per 50 Hz frame."""
+    emu = AYEmulator(clock, 44100, is_ym)
+    nx = max(channel_map.values()) + 1
+    cur = [None] * nx                 # per XM channel: dict(note, inst, vol)
+    last_xc = [-1] * 3
+    events = []; shape = 0
+    def gx(a, m):
+        if (a, m) in channel_map: return channel_map[(a, m)]
         return a
-    for frame in range(max_frames):
-        regs=player.play_tick();mixer=regs[7]
+    frame = -1
+    for frame, (regs, started) in enumerate(frames):
+        emu.set_registers(regs); emu.render_frame()
+        if regs[13] != 0xFF: shape = regs[13] & 0x0F
+        ep = max(1, (regs[12] << 8) | regs[11])
         for ac in range(3):
-            period=regs[ac*2]|((regs[ac*2+1]&0x0F)<<8);vr=regs[8+ac]
-            ue=bool(vr&0x10);vol=vr&0x0F;to=bool(mixer&(1<<ac));no=bool(mixer&(1<<(ac+3)))
-            ep=regs[11]|(regs[12]<<8);es=regs[13]if regs[13]!=0xFF else-1
-            note=None;ev=vol;mode=None;inst=1
-            if ue and to and no:
-                if es in REPEATING_ENV and ep>0:note=freq_to_xm(env_freq(ep));ev=15;mode=MODE_BUZZER;inst=3
-            elif ue and not to:
-                if period>0:note=freq_to_xm(ay_freq(period));ev=15;mode=MODE_ENV_TONE;inst=2
-            elif vol>0:
-                if not to and period>0:
-                    note=freq_to_xm(ay_freq(period));mode=MODE_MIXED if not no else MODE_TONE
-                    inst=MODE_INSTRUMENTS[mode]
-                elif not no:np=regs[6]&0x1F;note=max(1,min(96,72-np));mode=MODE_NOISE;inst=5
-            if note is None or ev==0 or mode is None:
-                ox=pax[ac]
-                if ox>=0 and pn[ox]>=0:
-                    events.append(NoteEvent(frame,ox,ac,pam[ac]or'','note_off',97))
-                    pn[ox]=-1;pv[ox]=0;pi[ox]=0;ps[ox]=True
-                pam[ac]=None;pax[ac]=-1;continue
-            xc=gx(ac,mode);xv=max(1,int(64*ev/15));ox=pax[ac]
-            if ox>=0 and ox!=xc:
-                if pn[ox]>=0:
-                    events.append(NoteEvent(frame,ox,ac,pam[ac]or'','note_off',97))
-                    pn[ox]=-1;pv[ox]=0;pi[ox]=0;ps[ox]=True
-            pam[ac]=mode;pax[ac]=xc;nn=False
-            if pn[xc]<0:nn=True
-            elif note!=pn[xc]:nn=True
-            elif inst!=pi[xc]:nn=True
-            elif ps[xc]:nn=True
-            elif xv>pv[xc]and(xv-pv[xc])>=16:nn=True
-            if nn:
-                if pn[xc]>=0:events.append(NoteEvent(frame,xc,ac,mode,'note_off',97))
-                events.append(NoteEvent(frame,xc,ac,mode,'note_on',note,inst,xv))
-                pn[xc]=note;pv[xc]=xv;pi[xc]=inst
-            ps[xc]=False
-        if(player.state.current_position>=player.num_positions-1 and
-           player.state.delay_counter==1 and player.channels[0].skip_counter==1 and frame>100):
-            if player._b(player.channels[0].address)==0:break
-    for xc in range(mx):
-        if pn[xc]>=0:events.append(NoteEvent(frame,xc,event_type='note_off',note=97))
+            info = classify(regs, ac, clock)
+            vr = regs[8 + ac]
+            mixer = regs[7]
+            if info is None and (vr & 0x10) and (mixer >> ac) & 1 and (mixer >> (ac + 3)) & 1 \
+                    and shape in REPEATING_ENV:
+                tri = shape in (0x0A, 0x0E)
+                f = clock / ((512.0 if tri else 256.0) * ep)
+                n = freq_to_xm(f)
+                if n is not None: info = (MODE_BUZZER, n, INST_BUZZ_TRI if tri else INST_BUZZ)
+            r = emu.chan_rms[ac]
+            xc_old = last_xc[ac]
+            if info is None or r < 1e-4:
+                if xc_old >= 0 and cur[xc_old] is not None:
+                    events.append(NoteEvent(frame, xc_old, ac, '', 'note_off', 97)); cur[xc_old] = None
+                last_xc[ac] = -1
+                continue
+            mode, note, inst = info
+            xc = gx(ac, mode)
+            if xc_old >= 0 and xc_old != xc and cur[xc_old] is not None:
+                events.append(NoteEvent(frame, xc_old, ac, '', 'note_off', 97)); cur[xc_old] = None
+            last_xc[ac] = xc
+            vol = xm_volume(r, inst, is_ym, scale)
+            c = cur[xc]
+            trig = (c is None or c['inst'] != inst or started[ac] or
+                    (mode in (MODE_BUZZER, MODE_ENV_TONE) and regs[13] != 0xFF))
+            if trig:
+                events.append(NoteEvent(frame, xc, ac, mode, 'note_on', note, inst, vol))
+                cur[xc] = {'note': note, 'inst': inst, 'vol': vol}
+            else:
+                if note != c['note']:
+                    events.append(NoteEvent(frame, xc, ac, mode, 'pitch', note, inst, vol)); c['note'] = note
+                if vol != c['vol']:
+                    events.append(NoteEvent(frame, xc, ac, mode, 'vol', note, inst, vol)); c['vol'] = vol
+    for xc in range(nx):
+        if cur[xc] is not None: events.append(NoteEvent(frame + 1, xc, 0, '', 'note_off', 97))
     return events
+
 
 # ═══════════════════════════════════════════════════════════════
-# XM & MIDI Writers (compact)
+# XM & MIDI writers
 # ═══════════════════════════════════════════════════════════════
 
 @dataclass
 class TN:
-    note:int=0;instrument:int=0;volume:int=0;effect:int=0;effect_param:int=0
-
-class AYGen:
-    P=32
-    @classmethod
-    def sq(c):return[int(max(-1,min(1,sum(math.sin(2*math.pi*h*i/c.P)/h for h in range(1,20,2))*1.2))*24000)for i in range(c.P)]
-    @classmethod
-    def buzz(c):p=c.P*2;return[int(max(-1,min(1,math.sin(2*math.pi*i/p)*.5+math.sin(6*math.pi*i/p)*.3+math.sin(10*math.pi*i/p)*.2))*24000)for i in range(p)]
-    @classmethod
-    def lead(c):return[int(max(-1,min(1,sum(math.sin(2*math.pi*i/c.P*h)*(1./h**.8)for h in range(1,12))*.5))*24000)for i in range(c.P)]
-    @classmethod
-    def nt(c):
-        import random;random.seed(42);return[int((math.sin(2*math.pi*i/c.P)*.5+random.gauss(0,.3))*24000)for i in range(c.P)]
-    @staticmethod
-    def noise(n=4096):
-        s,l=[],1
-        for _ in range(n):b=((l>>0)^(l>>1))&1;l=(l>>1)|(b<<14);s.append(24000 if l&1 else-24000)
-        return s
+    note: int = 0; instrument: int = 0; volume: int = 0; effect: int = 0; effect_param: int = 0
 
 class XMWriter:
-    def build_and_write(self,fn,events,title="",bpm=125,speed=3,fr=50,nc=6):
-        if nc%2:nc+=1
-        nc=max(4,min(32,nc));insts=self._mi();rps=speed*2.5/bpm;fpr=max(1,int(fr*rps))
-        rd={}
+    ROWS_PER_PATTERN = 128
+
+    def build_and_write(self, fn, events, title="", nc=6, is_ym=False, fps=FPS):
+        if nc % 2: nc += 1
+        nc = max(4, min(32, nc))
+        # one row per player frame: 2 ticks of 1/(2*fps) s (3xx needs >= 2 ticks per row)
+        speed, bpm = 2, int(round(5 * fps))
+        slide_ok = bpm <= 255
+        if not slide_ok:
+            speed, bpm = 1, max(32, min(255, int(round(2.5 * fps))))
+        insts = instruments(is_ym)
+        cells = {}
         for ev in events:
-            if ev.event_type not in('note_on','note_off'):continue
-            row=ev.frame//fpr;ch=ev.channel
-            if ch>=nc:continue
-            k=(row,ch)
-            if ev.event_type=='note_on':rd[k]=TN(max(1,min(96,ev.note)),min(ev.instrument,len(insts)),0x10+min(0x40,max(0,ev.volume)))
-            elif ev.event_type=='note_off' and k not in rd:rd[k]=TN(97)
-        mr=max((k[0]for k in rd),default=0)+1;rpp=64;np=max(1,min(256,(mr+rpp-1)//rpp))
-        pats=[]
-        for pi in range(np):
-            pat=[]
+            row, ch = ev.frame, ev.channel
+            if ch >= nc: continue
+            c = cells.setdefault((row, ch), TN())
+            if ev.event_type == 'note_on':
+                c.note, c.instrument, c.volume = max(1, min(96, ev.note)), ev.instrument, 0x10 + ev.volume
+                c.effect = c.effect_param = 0
+            elif ev.event_type == 'pitch':
+                if c.note != 97 and not (c.note and c.instrument):   # not over a fresh note
+                    c.note = max(1, min(96, ev.note))
+                    if slide_ok: c.effect, c.effect_param = 3, 0xFF
+                    else: c.instrument = ev.instrument      # no ticks for 3xx: re-trigger
+                    c.volume = c.volume or 0x10 + ev.volume
+            elif ev.event_type == 'vol':
+                if c.note != 97 and not (c.note and c.instrument):
+                    c.volume = 0x10 + ev.volume
+            elif ev.event_type == 'note_off':
+                if not c.note: c.note = 97
+        rpp = self.ROWS_PER_PATTERN
+        max_row = max((k[0] for k in cells), default=0) + 1
+        np_ = max(1, min(256, (max_row + rpp - 1) // rpp))
+        if (max_row + rpp - 1) // rpp > 256:
+            print("  Warning: song is longer than 256 patterns, truncated")
+        pats = []
+        for pi in range(np_):
+            pat = []
             for ri in range(rpp):
-                row=[TN()for _ in range(nc)]
-                for ch in range(nc):
-                    k=(pi*rpp+ri,ch)
-                    if k in rd:row[ch]=rd[k]
-                pat.append(row)
+                pat.append([cells.get((pi * rpp + ri, ch), TN()) for ch in range(nc)])
             pats.append(pat)
-        self._wx(fn,title,nc,bpm,speed,pats,insts,list(range(np)))
-    def _mi(self):
-        g=AYGen
-        def mk(n,p,l=True,pr=1):
-            o=int(round(12*math.log2(pr)))if pr>1 else 0
-            return{'name':n[:22],'samples':[{'name':n[:22],'data':p,'length':len(p),'loop_start':0,'loop_length':len(p)if l else 0,'loop_type':1 if l else 0,'volume':64,'finetune':0,'panning':128,'relative_note':o,'bits':16}]}
-        return[mk("AY Tone",g.sq()),mk("AY Env+Tone",g.lead()),mk("AY Buzzer",g.buzz(),pr=2),mk("AY Tone+Noise",g.nt()),mk("AY Noise",g.noise(),l=False)]
-    def _wx(self,fn,title,nc,bpm,speed,pats,insts,order):
-        with open(fn,'wb') as f:
-            f.write(b'Extended Module: ');f.write(title.encode('ascii','replace')[:20].ljust(20,b'\x00'))
-            f.write(b'\x1a');f.write(b'PT32XM Converter    ')
-            f.write(struct.pack('<HIHHHHHHH',0x0104,276,len(order),0,nc,len(pats),min(len(insts),128),1,speed)+struct.pack('<H',bpm))
-            ot=bytearray(256)
-            for i,o in enumerate(order[:256]):ot[i]=o
+        self._wx(fn, title, nc, bpm, speed, pats, insts, list(range(np_)))
+
+    def _wx(self, fn, title, nc, bpm, speed, pats, insts, order):
+        with open(fn, 'wb') as f:
+            f.write(b'Extended Module: ')
+            f.write(title.encode('ascii', 'replace')[:20].ljust(20, b'\x00'))
+            f.write(b'\x1a')
+            f.write(b'PT32XM Converter    ')
+            f.write(struct.pack('<HIHHHHHHH', 0x0104, 276, len(order), 0, nc, len(pats),
+                                min(len(insts), 128), 1, speed) + struct.pack('<H', bpm))
+            ot = bytearray(256)
+            for i, o in enumerate(order[:256]): ot[i] = o
             f.write(ot)
             for pat in pats:
-                pk=bytearray()
+                pk = bytearray()
                 for row in pat:
                     for ch in range(nc):
-                        nd=row[ch]if ch<len(row)else TN()
-                        hn=nd.note>0;hi=nd.instrument>0;hv=nd.volume>0;hf=nd.effect>0;hp=nd.effect_param>0
-                        if not(hn or hi or hv or hf or hp):pk.append(0x80)
+                        nd = row[ch] if ch < len(row) else TN()
+                        hn, hi, hv = nd.note > 0, nd.instrument > 0, nd.volume > 0
+                        hf, hp = nd.effect > 0, nd.effect_param > 0
+                        if not (hn or hi or hv or hf or hp):
+                            pk.append(0x80)
                         else:
-                            pb=0x80|(1 if hn else 0)|(2 if hi else 0)|(4 if hv else 0)|(8 if hf else 0)|(16 if hp else 0)
-                            pk.append(pb)
-                            if hn:pk.append(nd.note&0xFF)
-                            if hi:pk.append(nd.instrument&0xFF)
-                            if hv:pk.append(nd.volume&0xFF)
-                            if hf:pk.append(nd.effect&0xFF)
-                            if hp:pk.append(nd.effect_param&0xFF)
-                f.write(struct.pack('<IBH',9,0,len(pat))+struct.pack('<H',len(pk))+pk)
+                            pk.append(0x80 | (1 if hn else 0) | (2 if hi else 0) | (4 if hv else 0) |
+                                      (8 if hf else 0) | (16 if hp else 0))
+                            if hn: pk.append(nd.note & 0xFF)
+                            if hi: pk.append(nd.instrument & 0xFF)
+                            if hv: pk.append(nd.volume & 0xFF)
+                            if hf: pk.append(nd.effect & 0xFF)
+                            if hp: pk.append(nd.effect_param & 0xFF)
+                f.write(struct.pack('<IBH', 9, 0, len(pat)) + struct.pack('<H', len(pk)) + pk)
             for inst in insts[:128]:
-                ss=inst.get('samples',[])
-                if not ss:f.write(struct.pack('<I',29)+inst['name'].encode('ascii','replace')[:22].ljust(22,b'\x00')+struct.pack('<BH',0,0));continue
-                ihs=263;f.write(struct.pack('<I',ihs)+inst['name'].encode('ascii','replace')[:22].ljust(22,b'\x00'))
-                f.write(struct.pack('<BHI',0,len(ss),40)+bytearray(96))
-                ve=bytearray(48);struct.pack_into('<HH',ve,0,0,64);struct.pack_into('<HH',ve,4,100,64);f.write(ve)
-                pe=bytearray(48);struct.pack_into('<HH',pe,0,0,32);struct.pack_into('<HH',pe,4,100,32);f.write(pe)
-                f.write(bytes([2,2,0,0,1,0,0,1,1,0,0,0,0,0])+struct.pack('<H',0x800))
-                rem=ihs-(4+22+1+2+4+96+48+48+14+2)
-                if rem>0:f.write(b'\x00'*rem)
-                for s in ss:
-                    bps=2 if s.get('bits',16)==16 else 1
-                    f.write(struct.pack('<III',len(s['data'])*bps,s['loop_start']*bps,s['loop_length']*bps))
-                    f.write(struct.pack('<Bb',s.get('volume',64),max(-128,min(127,s.get('finetune',0)))))
-                    tb=s.get('loop_type',0)&3;
-                    if s.get('bits',16)==16:tb|=0x10
-                    f.write(struct.pack('<BBbB',tb,s.get('panning',128),max(-128,min(127,s.get('relative_note',0))),0))
-                    f.write(s.get('name','').encode('ascii','replace')[:22].ljust(22,b'\x00'))
-                for s in ss:
-                    prev=0
-                    for v in s['data']:v=max(-32768,min(32767,v));d_=(((v-prev)+32768)%65536-32768);f.write(struct.pack('<h',d_));prev=v
+                data = inst['data']
+                ihs = 263
+                f.write(struct.pack('<I', ihs) + inst['name'].encode('ascii', 'replace')[:22].ljust(22, b'\x00'))
+                f.write(struct.pack('<BHI', 0, 1, 40) + bytearray(96))
+                ve = bytearray(48); struct.pack_into('<HHHH', ve, 0, 0, 64, 100, 64); f.write(ve)
+                pe = bytearray(48); struct.pack_into('<HHHH', pe, 0, 0, 32, 100, 32); f.write(pe)
+                # envelopes off, fadeout 0: note-off (97) cuts the sound at once
+                f.write(bytes([2, 2, 0, 0, 1, 0, 0, 1, 0, 0, 0, 0, 0, 0]))
+                f.write(struct.pack('<H', 0))
+                f.write(b'\x00' * (ihs - (4 + 22 + 1 + 2 + 4 + 96 + 48 + 48 + 14 + 2)))
+                n = len(data)
+                f.write(struct.pack('<III', n * 2, 0, n * 2 if inst['loop'] else 0))
+                f.write(struct.pack('<BbBBb', 64, 0, (1 if inst['loop'] else 0) | 0x10, 128, inst['rel']))
+                f.write(b'\x00')
+                f.write(inst['name'].encode('ascii', 'replace')[:22].ljust(22, b'\x00'))
+                prev = 0
+                for v in data:
+                    f.write(struct.pack('<h', ((v - prev + 32768) % 65536) - 32768)); prev = v
+
 
 class MIDIWriter:
-    def __init__(self):self.tpqn=480
+    TPQN = 480
+    PROGRAM = {MODE_TONE: 80, MODE_ENV_TONE: 81, MODE_BUZZER: 38, MODE_MIXED: 87, MODE_NOISE: 0}
+
     @staticmethod
     def _vlq(v):
-        if v<0:v=0
-        r=[v&0x7F];v>>=7
-        while v:r.append((v&0x7F)|0x80);v>>=7
-        r.reverse();return bytes(r)
-    def write(self,fn,events,bpm=125,speed=3,fr=50,title=""):
-        tpqn=self.tpqn;tpf=tpqn*bpm/(60.0*fr);usec=int(60_000_000/bpm)
-        chs={};
-        for ev in events:chs.setdefault(ev.channel,[]).append(ev)
-        tracks=[];t0=[(0,bytes([0xFF,0x51,0x03,(usec>>16)&0xFF,(usec>>8)&0xFF,usec&0xFF]))]
-        if title:td=title.encode('ascii',errors='replace')[:127];t0.append((0,bytes([0xFF,0x01,len(td)])+td))
-        tracks.append(t0);gm=[80,81,74]
-        for ci,ch in enumerate(sorted(chs.keys())):
-            if ci>=15:break
-            mc=ci if ci<9 else ci+1;trk=[(0,bytes([0xC0|mc,gm[ci%3]]))];act={}
-            for ev in chs[ch]:
-                mt=int(ev.frame*tpf)
-                if ev.event_type=='note_on':
-                    mn=max(0,min(127,xm_note_to_midi(ev.note)));vel=max(1,min(127,ev.volume*2))
-                    if ch in act:pn,_=act[ch];trk.append((mt,bytes([0x80|mc,pn,0])))
-                    trk.append((mt,bytes([0x90|mc,mn,vel])));act[ch]=(mn,mt)
-                elif ev.event_type=='note_off':
-                    if ch in act:pn,_=act[ch];trk.append((mt,bytes([0x80|mc,pn,0])));del act[ch]
-            for pn,pt in act.values():trk.append((pt+tpqn,bytes([0x80|mc,pn,0])))
+        v = max(0, int(v)); r = [v & 0x7F]; v >>= 7
+        while v: r.append((v & 0x7F) | 0x80); v >>= 7
+        r.reverse(); return bytes(r)
+
+    @staticmethod
+    def _drum(xm_note):
+        return 42 if xm_note >= 75 else 38 if xm_note >= 58 else 36
+
+    def write(self, fn, events, bpm=125, fps=FPS, title=""):
+        tpqn = self.TPQN
+        tpf = tpqn * bpm / (60.0 * fps)
+        usec = int(60_000_000 / bpm)
+        by_ch = {}
+        for ev in events: by_ch.setdefault(ev.channel, []).append(ev)
+        t0 = [(0, bytes([0xFF, 0x51, 0x03, (usec >> 16) & 0xFF, (usec >> 8) & 0xFF, usec & 0xFF]))]
+        if title:
+            td = title.encode('ascii', errors='replace')[:127]; t0.append((0, bytes([0xFF, 0x01, len(td)]) + td))
+        tracks = [t0]
+        free = [c for c in range(16) if c != 9]
+        for xc in sorted(by_ch):
+            evs = by_ch[xc]
+            modes = {e.mode for e in evs if e.event_type == 'note_on'}
+            drum = modes == {MODE_NOISE}
+            if drum: mc = 9
+            elif free: mc = free.pop(0)
+            else: break
+            trk = []
+            note = None; prog = None; vel = 0; expr = -99
+            def off(t):
+                nonlocal note
+                if note is not None: trk.append((t, bytes([0x80 | mc, note, 0]))); note = None
+            def on(t, n, v):
+                nonlocal note
+                trk.append((t, bytes([0x90 | mc, n, v]))); note = n
+            last_t = 0
+            for ev in evs:
+                t = int(ev.frame * tpf); last_t = t
+                if ev.event_type == 'note_on':
+                    off(t)
+                    vel = max(1, min(127, ev.volume * 2 - 1))
+                    if drum:
+                        on(t, self._drum(ev.note), vel)
+                    else:
+                        p = self.PROGRAM.get(ev.mode, 80)
+                        if p != prog: trk.append((t, bytes([0xC0 | mc, p]))); prog = p
+                        e = max(1, min(127, ev.volume * 2 - 1))
+                        if abs(e - expr) >= 1: trk.append((t, bytes([0xB0 | mc, 11, e]))); expr = e
+                        on(t, max(0, min(127, ev.note + 11)), 100)
+                elif ev.event_type == 'pitch' and not drum and note is not None:
+                    n = max(0, min(127, ev.note + 11))
+                    if n != note: off(t); on(t, n, 100)
+                elif ev.event_type == 'vol' and not drum:
+                    e = max(1, min(127, ev.volume * 2 - 1))
+                    if abs(e - expr) >= 4: trk.append((t, bytes([0xB0 | mc, 11, e]))); expr = e
+                elif ev.event_type == 'note_off':
+                    off(t)
+            off(last_t + 1)
             tracks.append(trk)
-        with open(fn,'wb') as f:
-            f.write(b'MThd'+struct.pack('>I',6)+struct.pack('>HHH',1,len(tracks),tpqn))
+        with open(fn, 'wb') as f:
+            f.write(b'MThd' + struct.pack('>IHHH', 6, 1, len(tracks), tpqn))
             for t in tracks:
-                t.sort(key=lambda x:x[0]);d=bytearray();prev=0
-                for at,ed in t:d.extend(self._vlq(max(0,at-prev)));d.extend(ed);prev=at
-                d.extend(self._vlq(0));d.extend(b'\xFF\x2F\x00')
-                f.write(b'MTrk'+struct.pack('>I',len(d))+d)
+                t.sort(key=lambda x: x[0]); d = bytearray(); prev = 0
+                for at, ed in t:
+                    d.extend(self._vlq(max(0, at - prev))); d.extend(ed); prev = at
+                d.extend(self._vlq(0)); d.extend(b'\xFF\x2F\x00')
+                f.write(b'MTrk' + struct.pack('>I', len(d)) + d)
+
 
 # ═══════════════════════════════════════════════════════════════
 # Main
 # ═══════════════════════════════════════════════════════════════
 
+def shift_events(events, semitones):
+    """--transpose/--octave: move every melodic note (noise stays on its own scale)."""
+    if not semitones: return
+    for e in events:
+        if e.event_type in ('note_on', 'pitch') and e.mode != MODE_NOISE:
+            e.note = max(1, min(96, e.note + semitones))
+
 def convert_pt3(input_file, output_file=None, transpose=0, octave=0,
-                finetune=0, fmt='xm', midi_file=None, wav_file=None,
+                fmt='xm', midi_file=None, wav_file=None,
                 channel_map_spec='default', raw_notes=False,
-                sample_rate=44100, is_ym=False, wav_volume=0.8):
-    base=os.path.splitext(input_file)[0]
-    if not output_file:output_file=base+'.xm'
-    with open(input_file,'rb') as f:data=f.read()
-    channel_map=parse_channel_map(channel_map_spec)
-    num_xm_ay=max(channel_map.values())+1
+                sample_rate=44100, is_ym=False, wav_volume=0.8,
+                clock=CLOCK, norm_scale=1.0, layout='abc'):
+    base = os.path.splitext(input_file)[0]
+    if not output_file: output_file = base + '.xm'
+    with open(input_file, 'rb') as f: data = f.read()
+    channel_map = parse_channel_map(channel_map_spec)
+    num_xm_ay = max(channel_map.values()) + 1
 
     print(f"Конвертация: {input_file}")
-    player=PT3Player(data)
+    player = PT3Player(data)
     print(f"  Title: {player.title}")
     print(f"  Author: {player.author}")
     print(f"  Version: {player.version}, ToneTable: {player.tone_table_id}")
     print(f"  Speed: {player.initial_delay}, Positions: {player.num_positions}, Loop: {player.loop_position}")
 
-    total_rows=player.num_positions*64
-    max_frames=total_rows*player.initial_delay+1000
+    total_rows = player.num_positions * 64
+    max_frames = total_rows * player.initial_delay + 1000
 
-    # WAV rendering (uses its own player instance)
-    if fmt in ('wav','all') or wav_file:
-        wf = wav_file or base+'.wav'
-        wav_player = PT3Player(data)  # fresh instance
-        dur = render_wav(wav_player, wf, sample_rate, CLOCK, is_ym,
-                         stereo=True, volume=wav_volume, max_frames=max_frames)
+    if fmt in ('wav', 'all') or wav_file:
+        wf = wav_file or base + '.wav'
+        dur = render_wav((r for r, _ in pt3_frames(PT3Player(data), max_frames)), wf, sample_rate,
+                         clock, is_ym, stereo=True, volume=wav_volume, layout=layout)
         print(f"  WAV: {wf} ({os.path.getsize(wf)/1024:.1f} KB, {dur:.1f}s)")
         if fmt == 'wav' and not midi_file:
-            print(f"\nГотово!")
+            print("\nГотово!")
             return
 
-    # Note extraction
     if raw_notes:
-        num_xm=4;mode_str="RAW"
-        player2=PT3Player(data)
-        events=extract_notes_raw(player2,max_frames)
+        num_xm = 4; mode_str = "RAW"
+        events = extract_notes_raw(PT3Player(data), max_frames)
     else:
-        num_xm=num_xm_ay;mode_str=f"AY ({channel_map_spec})"
-        player2=PT3Player(data)
-        events=extract_notes_ay(player2,channel_map,max_frames)
+        num_xm = num_xm_ay; mode_str = f"AY ({channel_map_spec})"
+        events = extract_notes_ay(pt3_frames(PT3Player(data), max_frames), channel_map, clock, is_ym, norm_scale)
+    shift_events(events, transpose + 12 * octave)
 
-    note_ons=[e for e in events if e.event_type=='note_on']
+    note_ons = [e for e in events if e.event_type == 'note_on']
     print(f"  Mode: {mode_str}, Notes: {len(note_ons)}")
+    if not note_ons and fmt != 'wav':
+        print("  No notes!"); return
 
-    if not note_ons and fmt not in ('wav',):
-        print("  No notes!");return
-
-    bpm=125;speed=player.initial_delay
-
-    if fmt in('xm','both','all'):
-        xf=output_file if output_file.endswith('.xm')else base+'.xm'
-        XMWriter().build_and_write(xf,events,player.title,bpm,speed,50,num_xm)
+    if fmt in ('xm', 'both', 'all'):
+        xf = output_file if output_file.endswith('.xm') else base + '.xm'
+        XMWriter().build_and_write(xf, events, player.title, num_xm, is_ym)
         print(f"  XM: {xf} ({os.path.getsize(xf)/1024:.1f} KB, {num_xm} ch)")
 
-    if fmt in('midi','both','all') or midi_file:
-        mf=midi_file or base+'.mid'
-        MIDIWriter().write(mf,events,bpm,speed,50,player.title)
+    if fmt in ('midi', 'both', 'all') or midi_file:
+        mf = midi_file or base + '.mid'
+        MIDIWriter().write(mf, events, 125, FPS, player.title)
         print(f"  MIDI: {mf} ({os.path.getsize(mf)/1024:.1f} KB)")
 
-    if note_ons:
-        dur=max(e.frame for e in events)/50.0
-        print(f"\n  Total: {len(note_ons)} notes, {dur:.1f}s")
+    dur = max(e.frame for e in events) / float(FPS)
+    print(f"\n  Total: {len(note_ons)} notes, {dur:.1f}s")
 
 
 def main():
     import argparse
-    ap=argparse.ArgumentParser(
-        description='PT3→XM/MIDI/WAV Converter v7',
+    ap = argparse.ArgumentParser(
+        description='PT3→XM/MIDI/WAV Converter v8 (AY emulator, checked against zxtune123)',
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Output formats:
@@ -987,69 +988,75 @@ Output formats:
 WAV options:
   --sample-rate   Sample rate (default 44100)
   --ym            Use YM chip DAC table (default: AY)
-  --wav-volume    WAV volume 0.0-1.0 (default 0.8)
+  --clock         Chip clock in Hz (default 1773400 = ZX Spectrum 128; Pentagon: 1750000)
+  --wav-volume    WAV peak level 0.0-1.0 (default 0.8)
+
+XM/MIDI:
+  XM rows are player frames (50 Hz), volume follows the chip level every frame,
+  pitch changes inside a note use portamento 3FF (no re-trigger).
+  --norm-scale    XM volume multiplier (default 1.0)
 
 Note modes:
   --raw-notes   Original PT3 notes (no ornaments/arpeggio)
   (default)     AY register analysis with --channel-map
 
 Examples:
-  python pt32xm.py music.pt3 --wav
-  python pt32xm.py music.pt3 --all
-  python pt32xm.py music.pt3 --wav --ym --sample-rate 48000
-  python pt32xm.py music.pt3 --raw-notes --midi
-  python pt32xm.py music.pt3 --channel-map compact --all
+  python pt32xm-midi-wav.py music.pt3 --wav
+  python pt32xm-midi-wav.py music.pt3 --all
+  python pt32xm-midi-wav.py music.pt3 --wav --ym --sample-rate 48000
+  python pt32xm-midi-wav.py music.pt3 --raw-notes --midi
+  python pt32xm-midi-wav.py music.pt3 --channel-map compact --all
 """)
-    ap.add_argument('input',nargs='*')
-    ap.add_argument('-o','--output')
-    ap.add_argument('--octave',type=int,default=0)
-    ap.add_argument('--transpose',type=int,default=0)
-    ap.add_argument('--finetune',type=int,default=0)
-    ap.add_argument('--midi',action='store_true')
-    ap.add_argument('--midi-only',action='store_true')
-    ap.add_argument('--midi-file',type=str,default=None)
-    ap.add_argument('--wav',action='store_true',help='Render WAV')
-    ap.add_argument('--wav-file',type=str,default=None)
-    ap.add_argument('--all',action='store_true',help='Output XM+MIDI+WAV')
-    ap.add_argument('--sample-rate',type=int,default=44100)
-    ap.add_argument('--ym',action='store_true',help='Use YM DAC table')
-    ap.add_argument('--wav-volume',type=float,default=0.8)
-    ap.add_argument('--channel-map',type=str,default='default')
-    ap.add_argument('--raw-notes',action='store_true')
-    ap.add_argument('--list-presets',action='store_true')
-    args=ap.parse_args()
+    ap.add_argument('input', nargs='*')
+    ap.add_argument('-o', '--output')
+    ap.add_argument('--octave', type=int, default=0)
+    ap.add_argument('--transpose', type=int, default=0)
+    ap.add_argument('--midi', action='store_true')
+    ap.add_argument('--midi-only', action='store_true')
+    ap.add_argument('--midi-file', type=str, default=None)
+    ap.add_argument('--wav', action='store_true', help='Render WAV')
+    ap.add_argument('--wav-file', type=str, default=None)
+    ap.add_argument('--all', action='store_true', help='Output XM+MIDI+WAV')
+    ap.add_argument('--sample-rate', type=int, default=44100)
+    ap.add_argument('--ym', action='store_true', help='Use YM DAC table')
+    ap.add_argument('--clock', type=int, default=CLOCK)
+    ap.add_argument('--layout', choices=['abc', 'mono'], default='abc', help='WAV stereo layout')
+    ap.add_argument('--wav-volume', type=float, default=0.8)
+    ap.add_argument('--norm-scale', type=float, default=1.0)
+    ap.add_argument('--channel-map', type=str, default='default')
+    ap.add_argument('--raw-notes', action='store_true')
+    ap.add_argument('--list-presets', action='store_true')
+    args = ap.parse_args()
 
     if args.list_presets:
-        for name,m in CHANNEL_PRESETS.items():
-            nc=max(m.values())+1;print(f"  {name} ({nc} ch):")
-            for(ay,mode),xm in sorted(m.items()):print(f"    {get_channel_name(ay,mode):>10s} → XM {xm}")
+        for name, m in CHANNEL_PRESETS.items():
+            nc = max(m.values()) + 1; print(f"  {name} ({nc} ch):")
+            for (ay, mode), xm in sorted(m.items()): print(f"    {get_channel_name(ay, mode):>10s} → XM {xm}")
             print()
         sys.exit(0)
 
-    if not args.input:ap.print_help();sys.exit(1)
-    if args.output and len(args.input)>1:print("--output: single file only");sys.exit(1)
+    if not args.input: ap.print_help(); sys.exit(1)
+    if args.output and len(args.input) > 1: print("--output: single file only"); sys.exit(1)
 
-    if args.all:fmt='all'
-    elif args.wav and not args.midi and not args.midi_only:fmt='wav'
-    elif args.midi_only:fmt='midi'
-    elif args.midi:fmt='both'
-    else:fmt='xm'
+    if args.all: fmt = 'all'
+    elif args.wav and not args.midi and not args.midi_only: fmt = 'wav'
+    elif args.midi_only: fmt = 'midi'
+    elif args.midi: fmt = 'both'
+    else: fmt = 'xm'
 
-    # If --wav-file specified, always render wav
-    if args.wav_file:
-        if fmt=='xm':fmt='xm'  # keep xm but also wav via wav_file
-
-    try:channel_map=parse_channel_map(args.channel_map)
-    except ValueError as e:print(f"Error: {e}");sys.exit(1)
+    try: parse_channel_map(args.channel_map)
+    except ValueError as e: print(f"Error: {e}"); sys.exit(1)
 
     for inp in args.input:
-        if not os.path.exists(inp):print(f"Not found: {inp}");continue
+        if not os.path.exists(inp): print(f"Not found: {inp}"); continue
         try:
-            convert_pt3(inp,args.output,args.transpose,args.octave,args.finetune,
-                        fmt,args.midi_file,args.wav_file,args.channel_map,
-                        args.raw_notes,args.sample_rate,args.ym,args.wav_volume)
+            convert_pt3(inp, args.output, args.transpose, args.octave, fmt, args.midi_file,
+                        args.wav_file, args.channel_map, args.raw_notes, args.sample_rate,
+                        args.ym, args.wav_volume, args.clock, args.norm_scale, args.layout)
         except Exception as e:
-            import traceback;print(f"Error: {e}");traceback.print_exc()
+            import traceback; print(f"Error: {e}"); traceback.print_exc()
     print("\nГотово!")
 
-if __name__=='__main__':main()
+
+if __name__ == '__main__':
+    main()

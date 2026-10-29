@@ -1,0 +1,331 @@
+diff --git a/Makefile b/Makefile
+index bec8fc3..848363d 100755
+--- a/Makefile
++++ b/Makefile
+@@ -13,7 +13,7 @@ OBJS_RECOMPILER_32 = r4300/x86/assemble.o r4300/x86/gbc.o r4300/x86/gcop0.o r430
+ 
+ OBJS_RECOMPILER_64 = r4300/x86_64/assemble.o r4300/x86_64/gbc.o r4300/x86_64/gcop0.o r4300/x86_64/gcop1.o r4300/x86_64/gcop1_d.o r4300/x86_64/gcop1_l.o r4300/x86_64/gcop1_s.o r4300/x86_64/gcop1_w.o r4300/x86_64/gr4300.o r4300/x86_64/gregimm.o r4300/x86_64/gspecial.o r4300/x86_64/gtlb.o r4300/x86_64/regcache.o r4300/x86_64/rjump.o
+ 
+-OBJS = ai/ai_controller.o api/callbacks.o debugger/dbg_decoder.o main/main.o main/rom.o main/savestates.o main/util.o memory/memory.o pi/cart_rom.o pi/pi_controller.o r4300/cached_interp.o r4300/cp0.o r4300/cp1.o r4300/exception.o r4300/interupt.o r4300/mi_controller.o r4300/pure_interp.o r4300/r4300.o r4300/r4300_core.o r4300/recomp.o r4300/reset.o r4300/tlb.o rdp/rdp_core.o ri/rdram.o ri/rdram_detection_hack.o ri/ri_controller.o rsp/rsp_core.o rsp_hle/alist.o rsp_hle/alist_audio.o rsp_hle/alist_naudio.o rsp_hle/alist_nead.o rsp_hle/audio.o rsp_hle/cicx105.o rsp_hle/hle.o rsp_hle/hvqm.o rsp_hle/jpeg.o rsp_hle/memory.o rsp_hle/mp3.o rsp_hle/musyx.o rsp_hle/plugin.o rsp_hle/re2.o rsp_lle/rsp.o si/cic.o si/game_controller.o si/n64_cic_nus_6105.o si/pif.o si/si_controller.o usf/usf.o usf/barray.o usf/resampler.o vi/vi_controller.o $(OBJS_RECOMPILER_$(ARCH))
++OBJS = ai/ai_controller.o api/callbacks.o debugger/dbg_decoder.o main/main.o main/rom.o main/savestates.o main/util.o memory/memory.o pi/cart_rom.o pi/pi_controller.o r4300/cached_interp.o r4300/cp0.o r4300/cp1.o r4300/exception.o r4300/interupt.o r4300/mi_controller.o r4300/pure_interp.o r4300/r4300.o r4300/r4300_core.o r4300/recomp.o r4300/reset.o r4300/tlb.o rdp/rdp_core.o ri/rdram.o ri/rdram_detection_hack.o ri/ri_controller.o rsp/rsp_core.o rsp_hle/alist.o rsp_hle/alist_audio.o rsp_hle/alist_naudio.o rsp_hle/alist_nead.o rsp_hle/audio.o rsp_hle/cicx105.o rsp_hle/hle.o rsp_hle/trace.o rsp_hle/hvqm.o rsp_hle/jpeg.o rsp_hle/memory.o rsp_hle/mp3.o rsp_hle/musyx.o rsp_hle/plugin.o rsp_hle/re2.o rsp_lle/rsp.o si/cic.o si/game_controller.o si/n64_cic_nus_6105.o si/pif.o si/si_controller.o usf/usf.o usf/barray.o usf/resampler.o vi/vi_controller.o $(OBJS_RECOMPILER_$(ARCH))
+ 
+ OPTS_x86_64 = -DDYNAREC
+ OPTS_AArch64 =
+@@ -55,3 +55,9 @@ test/dumpresampled.o: test/dumpresampled.c
+ 
+ clean:
+ 	rm -f $(OBJS) liblazyusf.a liblazyusf.so* test/bench.o bench test/dumpresampled.o dumpresampled > /dev/null
++
++usftrace : test/usftrace.o liblazyusf.a
++	$(CC) -o $@ $^ ../psflib/libpsflib.a -lz -lm
++
++test/usftrace.o: test/usftrace.c
++	$(CC) $(CFLAGS) $(OPTS) -I../psflib -o $@ $^
+diff --git a/rsp_hle/alist.c b/rsp_hle/alist.c
+index 6982bbd..77aba54 100644
+--- a/rsp_hle/alist.c
++++ b/rsp_hle/alist.c
+@@ -63,6 +63,11 @@ static int16_t* alist_s16(struct hle_t* hle, uint16_t dmem)
+     return (int16_t*)(hle->alist_buffer + ((dmem ^ S16) & 0xfff));
+ }
+ 
++int16_t alist_trace_s16(struct hle_t* hle, uint16_t dmem)
++{
++    return *alist_s16(hle, dmem);
++}
++
+ 
+ static void sample_mix(int16_t* dst, int16_t src, int16_t gain)
+ {
+diff --git a/rsp_hle/alist_audio.c b/rsp_hle/alist_audio.c
+index 903268e..9642fcb 100644
+--- a/rsp_hle/alist_audio.c
++++ b/rsp_hle/alist_audio.c
+@@ -31,6 +31,10 @@
+ #include "memory.h"
+ #include "ucodes.h"
+ 
++
++#include <stdio.h>
++#include "trace.h"
++int16_t alist_trace_s16(struct hle_t* hle, uint16_t dmem);
+ enum { DMEM_BASE = 0x5c0 };
+ 
+ /* helper functions */
+@@ -82,6 +86,22 @@ static void ENVMIXER(struct hle_t* hle, uint32_t w1, uint32_t w2)
+             hle->alist_audio.target,
+             hle->alist_audio.rate,
+             address);
++
++    usf_adpcm_seen = 0;
++    usf_adpcm_init = 0;
++    usf_last_load_cnt = 0;
++    if (usf_trace_f) {
++        /* состояние огибающей лежит в DRAM (alist_envmix_exp сохраняет его туда);
++           регистры SETVOL значимы только при INIT */
++        short sb[40];
++        memcpy(sb, hle->dram + address, sizeof(sb));
++        fprintf(usf_trace_f, "E %u %u %u %u %d %d %d %d %d %d %d %d %x\n", flags, hle->alist_audio.in, hle->alist_audio.out,
++                hle->alist_audio.count,
++                (int)(*(int32_t *)(sb + 16) >> 16), (int)(*(int32_t *)(sb + 18) >> 16),
++                (int)(*(int32_t *)(sb + 4) >> 16), (int)(*(int32_t *)(sb + 6) >> 16),
++                (int)*(int32_t *)(sb + 8), (int)*(int32_t *)(sb + 10),
++                (int)*(int16_t *)(sb + 2), (int)*(int16_t *)(sb + 0), address);
++    }
+ }
+ 
+ static void ENVMIXER_GE(struct hle_t* hle, uint32_t w1, uint32_t w2)
+@@ -109,6 +129,42 @@ static void RESAMPLE(struct hle_t* hle, uint32_t w1, uint32_t w2)
+     uint16_t pitch   = w1;
+     uint32_t address = get_address(hle, w2);
+ 
++    if (usf_trace_f) {
++        if ((flags & A_INIT) && !usf_adpcm_init) {
++            /* перезапуск ресемплера = новая нота на голосе, даже если ADPCM-кадр был без INIT */
++            struct usf_voice *v0 = usf_voice_get(address - 0x40);
++            if (v0->cum > 0) { v0->cum = 0; v0->has = 0; }
++        }
++        if (!usf_adpcm_seen && usf_last_load_cnt > 0) {
++            /* голос с обычным PCM (без ADPCM): сохраняем загруженный LOADBUFF поток как сэмпл */
++            unsigned cnt = usf_last_load_cnt, i;
++            uint16_t ib = usf_last_load_in;
++            uint32_t vaddr = address - 0x40;
++            struct usf_voice *v = usf_voice_get(vaddr);
++            long off = -1, cum;
++            unsigned h;
++            if (flags & A_INIT) { v->cum = 0; v->hash = 0; v->has = 0; }
++            cum = v->cum;
++            if (!v->has) {
++                h = 2166136261u ^ 0x50434d00u; h *= 16777619u;
++                for (i = 0; i < 16 && i*2 < cnt; i++) { h ^= (uint16_t)alist_trace_s16(hle, ib + i*2); h *= 16777619u; }
++                v->hash = h; v->has = 1;
++            }
++            h = v->hash;
++            {
++                struct usf_cov *c = usf_cov_get(h);
++                if (cum + cnt > c->len && c->len < 262144) {
++                    off = ftell(usf_trace_pcm);
++                    for (i = 0; i < cnt/2; i++) { int16_t x = alist_trace_s16(hle, ib + i*2); fwrite(&x, 2, 1, usf_trace_pcm); }
++                    c->len = cum + cnt;
++                }
++            }
++            fprintf(usf_trace_f, "A %u %u %u %u %x %x %lx %ld %ld %u\n", flags & A_INIT, ib, 0, cnt, vaddr, 0, (unsigned long)h, cum, off, 1);
++            v->cum += cnt;
++        }
++        fprintf(usf_trace_f, "R %u %u %x %u %u %u\n", flags, pitch, address, hle->alist_audio.in, hle->alist_audio.out, hle->alist_audio.count);
++    }
++
+     alist_resample(
+             hle,
+             flags & A_INIT,
+@@ -124,6 +180,8 @@ static void SETVOL(struct hle_t* hle, uint32_t w1, uint32_t w2)
+ {
+     uint8_t flags = (w1 >> 16);
+ 
++    if (usf_trace_f) fprintf(usf_trace_f, "V %08x %08x\n", w1, w2);
++
+     if (flags & A_AUX) {
+         hle->alist_audio.dry = w1;
+         hle->alist_audio.wet = w2;
+@@ -143,6 +201,7 @@ static void SETVOL(struct hle_t* hle, uint32_t w1, uint32_t w2)
+ static void SETLOOP(struct hle_t* hle, uint32_t UNUSED(w1), uint32_t w2)
+ {
+     hle->alist_audio.loop = get_address(hle, w2);
++    if (usf_trace_f) fprintf(usf_trace_f, "L %x\n", hle->alist_audio.loop);
+ }
+ 
+ static void ADPCM(struct hle_t* hle, uint32_t w1, uint32_t w2)
+@@ -161,12 +220,45 @@ static void ADPCM(struct hle_t* hle, uint32_t w1, uint32_t w2)
+             hle->alist_audio.table,
+             hle->alist_audio.loop,
+             address);
++
++    usf_adpcm_seen = 1;
++    usf_adpcm_init = flags & A_INIT;
++    if (usf_trace_f) {
++        unsigned cnt = align(hle->alist_audio.count, 32);
++        uint16_t ob = hle->alist_audio.out + 32;
++        long off = -1; long cum = 0; unsigned h = 0;
++        struct usf_voice *v = usf_voice_get(address);
++        if (flags & A_INIT) { v->cum = 0; v->hash = 0; v->has = 0; }
++        cum = v->cum;
++        if (!v->has) {
++            unsigned i; h = 2166136261u ^ usf_cur_table; h *= 16777619u;
++            for (i = 0; i < 16 && i*2 < cnt; i++) { h ^= (uint16_t)alist_trace_s16(hle, ob + i*2); h *= 16777619u; }
++            v->hash = h; v->has = 1;
++        }
++        h = v->hash;
++        {
++            struct usf_cov *c = usf_cov_get(h);
++            if (cum + cnt > c->len && c->len < 262144) {
++                unsigned i;
++                off = ftell(usf_trace_pcm);
++                for (i = 0; i < cnt/2; i++) { int16_t x = alist_trace_s16(hle, ob + i*2); fwrite(&x, 2, 1, usf_trace_pcm); }
++                c->len = cum + cnt;
++            }
++        }
++        fprintf(usf_trace_f, "A %u %u %u %u %x %x %lx %ld %ld %u\n", flags, hle->alist_audio.in, hle->alist_audio.out, cnt,
++                address, hle->alist_audio.loop, (unsigned long)h, cum, off, (cum+cnt) < 0x7fffffff);
++        v->cum += cnt;
++    }
+ }
+ 
+ static void LOADBUFF(struct hle_t* hle, uint32_t UNUSED(w1), uint32_t w2)
+ {
+     uint32_t address = get_address(hle, w2);
+ 
++    if (usf_trace_f) fprintf(usf_trace_f, "B %u %u %x\n", hle->alist_audio.in, hle->alist_audio.count, address);
++    usf_last_load_in = hle->alist_audio.in;
++    usf_last_load_cnt = hle->alist_audio.count;
++
+     if (hle->alist_audio.count == 0)
+         return;
+ 
+@@ -177,6 +269,8 @@ static void SAVEBUFF(struct hle_t* hle, uint32_t UNUSED(w1), uint32_t w2)
+ {
+     uint32_t address = get_address(hle, w2);
+ 
++    if (usf_trace_f) fprintf(usf_trace_f, "S %u %u %x\n", hle->alist_audio.out, hle->alist_audio.count, address);
++
+     if (hle->alist_audio.count == 0)
+         return;
+ 
+@@ -215,6 +309,8 @@ static void LOADADPCM(struct hle_t* hle, uint32_t w1, uint32_t w2)
+     uint16_t count   = w1;
+     uint32_t address = get_address(hle, w2);
+ 
++    if (usf_trace_f) fprintf(usf_trace_f, "T %x %u\n", address, count);
++    usf_cur_table = address;
+     dram_load_u16(hle, (uint16_t*)hle->alist_audio.table, address, align(count, 8) >> 1);
+ }
+ 
+@@ -286,6 +382,7 @@ void alist_process_audio(struct hle_t* hle)
+     #endif
+ 
+     clear_segments(hle);
++    if (usf_trace_f) fprintf(usf_trace_f, "F\n");
+     #ifdef DEBUG_INFO
+     alist_process(hle, ABI, 0x10, ABI_names);
+     #else
+diff --git a/rsp_hle/hle.c b/rsp_hle/hle.c
+index 4e65113..0e2a580 100644
+--- a/rsp_hle/hle.c
++++ b/rsp_hle/hle.c
+@@ -1,3 +1,5 @@
++#include <stdio.h>
++#include "trace.h"
+ /* * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * *
+  *   Mupen64plus-rsp-hle - hle.c                                           *
+  *   Mupen64Plus homepage: https://mupen64plus.org/                        *
+@@ -243,6 +245,7 @@ static ucode_func_t try_audio_task_detection(struct hle_t* hle)
+     /* identify audio ucode by using the content of ucode_data */
+     uint32_t ucode_data = *dmem_u32(hle, TASK_UCODE_DATA);
+     uint32_t v;
++    { static int once; if(!once){once=1; if (usf_trace_f) fprintf(usf_trace_f, "# ucode %08x %08x %08x %08x\n",*dram_u32(hle,ucode_data),*dram_u32(hle,ucode_data+0x10),*dram_u32(hle,ucode_data+0x28),*dram_u32(hle,ucode_data+0x30));}}
+ 
+     if (*dram_u32(hle, ucode_data) == 0x00000001) {
+         if (*dram_u32(hle, ucode_data + 0x30) == 0xf0000f00) {
+diff --git a/rsp_hle/trace.c b/rsp_hle/trace.c
+new file mode 100644
+index 0000000..f7f17be
+--- /dev/null
++++ b/rsp_hle/trace.c
+@@ -0,0 +1,27 @@
++#include "trace.h"
++uint32_t usf_cur_table;
++int usf_adpcm_seen;
++int usf_adpcm_init;
++uint16_t usf_last_load_in;
++unsigned usf_last_load_cnt;
++FILE *usf_trace_f, *usf_trace_pcm;
++static struct usf_voice voices[4096];
++static struct usf_cov covs[65536];
++struct usf_voice *usf_voice_get(uint32_t addr)
++{
++    unsigned i = (addr * 2654435761u) >> 20 & 4095;
++    for (;;) {
++        if (!voices[i].used) { voices[i].used = 1; voices[i].addr = addr; return &voices[i]; }
++        if (voices[i].addr == addr) return &voices[i];
++        i = (i + 1) & 4095;
++    }
++}
++struct usf_cov *usf_cov_get(unsigned hash)
++{
++    unsigned i = (hash * 2654435761u) >> 16 & 65535;
++    for (;;) {
++        if (!covs[i].used) { covs[i].used = 1; covs[i].hash = hash; return &covs[i]; }
++        if (covs[i].hash == hash) return &covs[i];
++        i = (i + 1) & 65535;
++    }
++}
+diff --git a/rsp_hle/trace.h b/rsp_hle/trace.h
+new file mode 100644
+index 0000000..a783b22
+--- /dev/null
++++ b/rsp_hle/trace.h
+@@ -0,0 +1,15 @@
++#ifndef USF_TRACE_H
++#define USF_TRACE_H
++#include <stdio.h>
++#include <stdint.h>
++extern uint32_t usf_cur_table;
++extern int usf_adpcm_seen;
++extern int usf_adpcm_init;
++extern uint16_t usf_last_load_in;
++extern unsigned usf_last_load_cnt;
++extern FILE *usf_trace_f, *usf_trace_pcm;
++struct usf_voice { uint32_t addr; long cum; unsigned hash; int has; int used; };
++struct usf_cov { unsigned hash; long len; int used; };
++struct usf_voice *usf_voice_get(uint32_t addr);
++struct usf_cov *usf_cov_get(unsigned hash);
++#endif
+diff --git a/test/usftrace.c b/test/usftrace.c
+new file mode 100644
+index 0000000..62c0b0e
+--- /dev/null
++++ b/test/usftrace.c
+@@ -0,0 +1,44 @@
++#include <stdlib.h>
++#include <string.h>
++#include "../usf/usf.h"
++#include "../rsp_hle/trace.h"
++#include <psflib.h>
++unsigned char * state = 0;
++unsigned int enable_compare = 0, enable_fifo_full = 0;
++static void * f_open(void * c, const char * p){ return fopen(p,"rb"); }
++static size_t f_read(void *p,size_t s,size_t n,void*f){ return fread(p,s,n,(FILE*)f); }
++static int f_seek(void*f,int64_t o,int w){ return fseek((FILE*)f,o,w); }
++static int f_close(void*f){ return fclose((FILE*)f); }
++static long f_tell(void*f){ return ftell((FILE*)f); }
++static psf_file_callbacks cb = { "\\/:", NULL, f_open, f_read, f_seek, f_close, f_tell };
++static int loader(void * c, const uint8_t * exe, size_t es, const uint8_t * r, size_t rs){ if (exe && es>0) return -1; return usf_upload_section(state, r, rs); }
++static int info(void * c, const char * n, const char * v){
++    if (!strcasecmp(n,"_enablecompare") && *v) enable_compare = 1;
++    if (!strcasecmp(n,"_enablefifofull") && *v) enable_fifo_full = 1;
++    return 0; }
++static void msg(void*u,const char*m){ }
++int main(int argc, char **argv)
++{
++    /* usftrace in.miniusf out_prefix seconds [wav.raw] */
++    if (argc < 4) { fprintf(stderr,"usage: usftrace in.miniusf out_prefix seconds [out.raw]\n"); return 2; }
++    char p[4096]; int16_t buf[2048]; int32_t rate = 0;
++    state = malloc(usf_get_state_size()); usf_clear(state);
++    if (psf_load(argv[1], &cb, 0x21, loader, 0, info, 0, 1, msg, 0) <= 0) return 1;
++    usf_set_compare(state, enable_compare); usf_set_fifo_full(state, enable_fifo_full);
++    usf_set_hle_audio(state, 1);
++    snprintf(p,sizeof p,"%s.trace",argv[2]); usf_trace_f = fopen(p,"w");
++    snprintf(p,sizeof p,"%s.pcm",argv[2]); usf_trace_pcm = fopen(p,"wb");
++    FILE *raw = argc > 4 ? fopen(argv[4],"wb") : NULL;
++    long total = (long)(atof(argv[3]) * 44100);
++    usf_render(state, NULL, 0, &rate);
++    fprintf(usf_trace_f, "# rate %d\n", (int)rate);
++    while (total > 0) {
++        int n = total > 1024 ? 1024 : (int)total;
++        usf_render_resampled(state, buf, n, 44100);
++        if (raw) fwrite(buf, n, 4, raw);
++        total -= n;
++    }
++    usf_shutdown(state);
++    fclose(usf_trace_f); fclose(usf_trace_pcm); if (raw) fclose(raw);
++    return 0;
++}
