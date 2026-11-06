@@ -1,5 +1,6 @@
 // Audacious 4.x input plugin: ZX Spectrum / AY .psg (дамп регистров AY)
 // Парсер и эмулятор - порт psg2xm-midi-wav.py.
+#include "export.hpp"
 #include <cstdio>
 #include <cstring>
 #include <libaudcore/audstrings.h>
@@ -61,12 +62,41 @@ bool load_psg(const char * filename, std::vector<ay::Regs> & frames, int & fps)
 }
 
 AY_DEFINE_COMMON("psg")
+AY_EXPORT_DEFINE_COMMON
 
-const PreferencesWidget widgets[] = {AY_COMMON_WIDGETS("psg")};
+const PreferencesWidget widgets[] = {AY_COMMON_WIDGETS("psg"), WidgetSeparator(),
+    EXPORT_WIDGETS("psg"),
+    AY_EXPORT_WIDGETS("psg")};
 const PluginPreferences prefs = {{widgets}};
-const char * const defaults[] = {AY_COMMON_DEFAULTS, nullptr};
+const char * const defaults[] = {AY_COMMON_DEFAULTS, EXPORT_DEFAULTS, AY_EXPORT_DEFAULTS, nullptr};
 
 } // namespace
+
+
+static std::string psg_export(const exporter::Job & j, bool xm, bool midi)
+{
+    std::vector<ay::Regs> fr;
+    int fps;
+    if (!load_psg(("file://" + j.input).c_str(), fr, fps)) return "cannot read PSG file";
+    // в PSG нет событий "новая нота": старт = скачок громкости вверх
+    std::vector<std::array<bool, 3>> started;
+    int prev[3] = {0, 0, 0};
+    for (auto & r : fr)
+    {
+        std::array<bool, 3> st{};
+        for (int ac = 0; ac < 3; ac++)
+        {
+            int vr = r[8 + ac], level = (vr & 0x10) ? 15 : (vr & 0x0F);
+            st[ac] = level - prev[ac] >= 4;
+            prev[ac] = level;
+        }
+        started.push_back(st);
+    }
+    std::string title = j.out_base.substr(j.out_base.rfind('/') + 1);
+    return ayexp::export_ay(fr, started, title, j.out_base, xm, midi, ay_export_options("psg", fps));
+}
+
+EXPORT_DEFINE("psg", "psg2xm-midi-wav.py", true, nullptr, "Export selected to XM/MIDI (PSG)...", psg_export, "psg")
 
 class PSGPlugin : public AYPluginBase
 {
@@ -76,7 +106,8 @@ public:
     static constexpr PluginInfo info = {N_("PSG Decoder (AY)"), "psg", about, &prefs};
 
     constexpr PSGPlugin() : AYPluginBase(info, InputInfo().with_exts(exts), "psg") {}
-    bool init() { aud_config_set_defaults("psg", defaults); return true; }
+    bool init() { aud_config_set_defaults("psg", defaults); export_register(); return true; }
+    void cleanup() { export_unregister(); }
 
     bool read_tag(const char * filename, VFSFile &, Tuple & tuple, Index<char> *)
     {

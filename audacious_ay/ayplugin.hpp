@@ -6,6 +6,7 @@
 #include <libaudcore/preferences.h>
 #include <libaudcore/i18n.h>
 #include "ay.hpp"
+#include "ayexport.hpp"
 
 #ifndef EXPORT
 #define EXPORT __attribute__((visibility("default")))
@@ -49,6 +50,33 @@
     "b_on", "TRUE", "b_tone", "TRUE", "b_noise", "TRUE", "b_env", "TRUE", \
     "c_on", "TRUE", "c_tone", "TRUE", "c_noise", "TRUE", "c_env", "TRUE", \
     "chip", "0", "layout", "0", "clock", "1773400", "gain", "100"
+
+// Настройки встроенного экспорта (вставляются после EXPORT_WIDGETS)
+#define AY_EXPORT_WIDGETS(SEC) \
+    WidgetCheck(N_("Use the built-in converter (no Python needed)"), WidgetBool(SEC, "exp_builtin")), \
+    WidgetCombo(N_("XM channel layout:"), WidgetInt(SEC, "exp_layout"), {{ay_exp_layouts}}), \
+    WidgetSpin(N_("Transpose note names:"), WidgetInt(SEC, "exp_transpose"), {-48, 48, 1, N_("semitones")}), \
+    WidgetSpin(N_("XM volume scale:"), WidgetInt(SEC, "exp_volscale"), {10, 300, 5, "%"})
+#define AY_EXPORT_DEFINE_COMMON \
+    const ComboItem ay_exp_layouts[] = {ComboItem(N_("default (tone / buzzer / noise separate)"), 0), \
+        ComboItem(N_("compact"), 1), ComboItem(N_("split-all"), 2), ComboItem(N_("minimal (3 channels)"), 3), \
+        ComboItem(N_("buzzer-split"), 4)};
+#define AY_EXPORT_DEFAULTS "exp_builtin", "TRUE", "exp_layout", "0", "exp_transpose", "0", "exp_volscale", "100"
+
+// Параметры встроенного экспорта из настроек плагина
+inline ayexp::Options ay_export_options(const char * sec, double fps)
+{
+    ayexp::Options o;
+    o.clock = aud_get_int(sec, "clock");
+    if (o.clock < 100000) o.clock = 1773400;
+    o.ym = aud_get_int(sec, "chip") == 1;
+    int vs = aud_get_int(sec, "exp_volscale");
+    o.scale = (vs > 0 ? vs : 100) / 100.0;
+    o.map_preset = aud_get_int(sec, "exp_layout");
+    o.transpose = aud_get_int(sec, "exp_transpose");
+    o.fps = fps;
+    return o;
+}
 
 struct AYSettings
 {

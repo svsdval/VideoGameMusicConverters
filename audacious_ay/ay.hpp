@@ -93,6 +93,7 @@ public:
         int n = (int)t1 - (int)tick_pos;
         tick_pos = t1;
         tmp.assign((size_t)n * 2, 0.0f);
+        double sum[3] = {0, 0, 0}, sum2[3] = {0, 0, 0};
 
         int mixer = r[7];
         int noise_p = std::max(1, r[6] & 0x1F) * 2;
@@ -119,11 +120,18 @@ public:
                 double v;
                 if (va & 0x10) v = dac[gate ? env : 0];
                 else v = gate ? dac[(va & 0x0F) * 2 + 1] : 0.0;
+                sum[i] += v; sum2[i] += v * v;
                 l += v * pan[i][0];
                 rr += v * pan[i][1];
             }
             tmp[2 * k] = (float)l;
             tmp[2 * k + 1] = (float)rr;
+        }
+
+        for (int i = 0; i < 3; i++)
+        {
+            double m = n ? sum[i] / n : 0.0;
+            chan_rms[i] = n ? std::sqrt(std::max(0.0, sum2[i] / n - m * m)) : 0.0;
         }
 
         double s1 = sample_pos + samples_per_frame;
@@ -150,6 +158,8 @@ public:
         }
         return ns;
     }
+
+    double chan_rms[3] = {0, 0, 0};   // AC rms каналов в последнем кадре
 
 private:
     int sr;

@@ -12,14 +12,30 @@ W="$HERE/build"; mkdir -p "$W"; cd "$W"
 
 # lazyusf2 (PIC, без трейс-патча, но с патчем мьюта голосов)
 rm -f lazyusf2/test/*.o
-grep -q usf_voice_mute_mask lazyusf2/rsp_hle/alist.c || (cd lazyusf2 && git apply "$HERE/voicemute.patch")
+# патчи lazyusf2: трассировка аудио-микрокода (для экспорта XM/MIDI) и мьют голосов
+(cd lazyusf2 &&
+ { [ -f rsp_hle/trace.c ] || git apply "$HERE/../usf_tracer/usftrace.patch"; } &&
+ { grep -q usf_voice_mute_mask rsp_hle/alist.c || git apply "$HERE/voicemute.patch"; } &&
+ { grep -q usf_trace_reset rsp_hle/trace.c || cat >> rsp_hle/trace.c <<'EOT'
+
+#include <string.h>
+void usf_trace_reset(void)
+{
+    memset(voices, 0, sizeof voices);
+    memset(covs, 0, sizeof covs);
+    usf_adpcm_seen = usf_adpcm_init = 0;
+    usf_last_load_cnt = 0;
+    usf_cur_table = 0;
+}
+EOT
+ })
 make -C lazyusf2 -j"$(nproc)" liblazyusf.a OPTFLAGS="-O2 -fPIC"
 gcc -O2 -fPIC -c psflib/psflib.c -o psflib.o -I psflib
 
 # заголовки Audacious
 AUDINC="$("$HERE/../audacious_inc.sh")"
 
-g++ -std=c++17 -O2 -fPIC -shared -Wall $AUDINC $(pkg-config --cflags glib-2.0) \
+g++ -std=c++17 -I"$HERE/../audacious_common" -DEXPORT_SCRIPT_DIR="\"$(cd "$HERE/.." && pwd)\"" -O2 -fPIC -shared -Wall $AUDINC $(pkg-config --cflags glib-2.0) \
     -I psflib -I lazyusf2 -o "$HERE/usf.so" "$HERE/usf.cc" psflib.o lazyusf2/liblazyusf.a -lz
 echo "OK: $HERE/usf.so"
 

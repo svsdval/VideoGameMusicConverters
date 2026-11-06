@@ -1,5 +1,7 @@
 // Audacious 4.x input plugin: Commodore 64 .sid (PSID/RSID, поддержка нескольких SID и подтреков)
 // Эмуляция - libsidplayfp (reSIDfp); sid2xm-midi-wav.py использует собственную упрощённую модель.
+#include "export.hpp"
+#include "sidexport.hpp"
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -44,6 +46,10 @@ const ComboItem c64_models[] = {ComboItem(N_("From file (default PAL)"), 0),
 const ComboItem samplings[] = {ComboItem(N_("Interpolate (fast)"), 0),
                                ComboItem(N_("Resample (accurate)"), 1)};
 
+const ComboItem sid_exp_layouts[] = {ComboItem(N_("default (one channel per voice)"), 0),
+                                     ComboItem(N_("split (channel per voice and waveform)"), 1),
+                                     ComboItem(N_("compact (noise on its own channel)"), 2)};
+
 const PreferencesWidget widgets[] = {
     WidgetLabel(N_("<b>Voices</b> (applied immediately; SID 2/3 exist in multi-SID tunes)")),
     WidgetBox({{sid_row1}, true, false}),
@@ -61,7 +67,11 @@ const PreferencesWidget widgets[] = {
     WidgetSpin(N_("Volume:"), WidgetInt("sid", "gain"), {10, 300, 5, "%"}),
     WidgetSpin(N_("Default length:"), WidgetInt("sid", "default_length"), {10, 3600, 10, N_("s")}),
     WidgetSpin(N_("Fade-out:"), WidgetInt("sid", "default_fade"), {0, 60, 1, N_("s")}),
-    WidgetLabel(N_("A .sid file has no length of its own, so the default length is used."))};
+    WidgetLabel(N_("A .sid file has no length of its own, so the default length is used.")),
+    WidgetSeparator(),
+    EXPORT_WIDGETS("sid"),
+    WidgetCheck(N_("Use the built-in converter (no Python needed)"), WidgetBool("sid", "exp_builtin")),
+    WidgetCombo(N_("XM channel layout:"), WidgetInt("sid", "exp_layout"), {{sid_exp_layouts}})};
 const PluginPreferences prefs = {{widgets}};
 
 const char * const defaults[] = {
@@ -69,7 +79,7 @@ const char * const defaults[] = {
     "s2v1", "TRUE", "s2v2", "TRUE", "s2v3", "TRUE",
     "s3v1", "TRUE", "s3v2", "TRUE", "s3v3", "TRUE",
     "sid_model", "0", "c64_model", "0", "filter", "TRUE", "digiboost", "FALSE",
-    "sampling", "0", "gain", "100", "default_length", "180", "default_fade", "4", nullptr};
+    "sampling", "0", "gain", "100", "default_length", "180", "default_fade", "4", EXPORT_DEFAULTS, "exp_builtin", "TRUE", "exp_layout", "0", nullptr};
 
 void apply_voice_mutes(sidplayfp & engine)
 {
@@ -102,6 +112,15 @@ Spec parse_spec(const char * filename)
 
 } // namespace
 
+
+static std::string sid_export(const exporter::Job & j, bool xm, bool midi)
+{
+    int secs = aud_get_int("sid", "exp_seconds");
+    return sidexp::export_sid(j.input, j.sub, j.out_base, xm, midi, secs > 0 ? secs : 60, aud_get_int("sid", "exp_layout"));
+}
+
+EXPORT_DEFINE("sid", "sid2xm-midi-wav.py", true, "--song", "Export selected to XM/MIDI (SID)...", sid_export, "sid", "psid", "rsid")
+
 class SIDPlugin : public InputPlugin
 {
 public:
@@ -113,7 +132,8 @@ public:
         : InputPlugin(info, InputInfo(FlagSubtunes).with_exts(exts)) {}
 
     bool is_our_file(const char *, VFSFile &) { return false; }
-    bool init() { aud_config_set_defaults("sid", defaults); return true; }
+    bool init() { aud_config_set_defaults("sid", defaults); export_register(); return true; }
+    void cleanup() { export_unregister(); }
 
     bool read_tag(const char * filename, VFSFile &, Tuple & tuple, Index<char> *)
     {

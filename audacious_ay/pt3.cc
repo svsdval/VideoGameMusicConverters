@@ -1,5 +1,6 @@
 // Audacious 4.x input plugin: ZX Spectrum Pro Tracker 3 (.pt3)
 // Плеер - порт PT3Player из pt32xm-midi-wav.py (по pt3player.c, Bulba/Volutar).
+#include "export.hpp"
 #include <cstdio>
 #include <cstring>
 #include <string>
@@ -64,6 +65,7 @@ struct Chan
     int ton_slide_delay = 0, cur_ton_sliding = 0, ton_accum = 0;
     int ton_slide_step = 0, ton_delta = 0, skip_counter = 1;
     int smp_idx = 0;
+    bool note_changed = false;
 };
 
 struct State
@@ -172,6 +174,7 @@ public:
     {
         Chan & c = ch[abc];
         int pr_note = c.note, pr_sliding = c.cur_ton_sliding;
+        c.note_changed = false;
         std::vector<int> ef;
         bool quit = false;
         while (!quit && c.address < (int)d.size())
@@ -209,7 +212,7 @@ public:
             {
                 c.note = op - 0x50; c.pos_smp = 0; c.cur_amp_slide = 0; c.cur_noise_slide = 0;
                 c.cur_env_slide = 0; c.pos_orn = 0; c.ton_slide_count = 0; c.cur_ton_sliding = 0;
-                c.ton_accum = 0; c.cur_onoff = 0; c.enabled = true; quit = true;
+                c.ton_accum = 0; c.cur_onoff = 0; c.enabled = true; c.note_changed = true; quit = true;
             }
             else if (op >= 0x40 && op <= 0x4F) { set_orn(c, op - 0x40); c.pos_orn = 0; }
             else if (op >= 0x20 && op <= 0x3F) st.noise_base = op - 0x20;
@@ -340,6 +343,7 @@ public:
     ay::Regs play_tick()
     {
         ay[13] = 0xFF;
+        for (auto & c : ch) c.note_changed = false;
         if (positions.empty()) { ay::Regs z; z.fill(0); z[13] = 0xFF; z[7] = 0x3F; return z; }
         if (--st.delay_counter == 0)
         {
@@ -383,13 +387,14 @@ public:
     }
 
     // как pt3_frames() в Python
-    std::vector<ay::Regs> run() 
+    std::vector<ay::Regs> run(std::vector<std::array<bool, 3>> * started = nullptr)
     {
         std::vector<ay::Regs> out;
         int max_frames = num_positions * 64 * initial_delay + 1000;
         for (int f = 0; f < max_frames; f++)
         {
             out.push_back(play_tick());
+            if (started) started->push_back({ch[0].note_changed, ch[1].note_changed, ch[2].note_changed});
             if (finished(f)) break;
         }
         return out;
@@ -433,17 +438,34 @@ bool read_file(const char * filename, std::vector<uint8_t> & d)
 }
 
 AY_DEFINE_COMMON("pt3")
+AY_EXPORT_DEFINE_COMMON
 
 const PreferencesWidget widgets[] = {
     AY_COMMON_WIDGETS("pt3"),
     WidgetSeparator(),
     WidgetLabel(N_("<b>Samples / ornaments</b> (applied at the next track start)")),
     WidgetEntry(N_("Muted samples (e.g. 3, 5, 10-12):"), WidgetString("pt3", "muted_samples")),
-    WidgetCheck(N_("Disable ornaments (arpeggios / pitch tables)"), WidgetBool("pt3", "no_ornaments"))};
+    WidgetCheck(N_("Disable ornaments (arpeggios / pitch tables)"), WidgetBool("pt3", "no_ornaments")),
+    WidgetSeparator(),
+    EXPORT_WIDGETS("pt3"),
+    AY_EXPORT_WIDGETS("pt3")};
 const PluginPreferences prefs = {{widgets}};
-const char * const defaults[] = {AY_COMMON_DEFAULTS, "muted_samples", "", "no_ornaments", "FALSE", nullptr};
+const char * const defaults[] = {AY_COMMON_DEFAULTS, "muted_samples", "", "no_ornaments", "FALSE", EXPORT_DEFAULTS, AY_EXPORT_DEFAULTS, nullptr};
 
 } // namespace
+
+
+static std::string pt3_export(const exporter::Job & j, bool xm, bool midi)
+{
+    std::vector<uint8_t> d;
+    if (!read_file(("file://" + j.input).c_str(), d)) return "cannot read file";
+    PT3Player p(std::move(d));
+    std::vector<std::array<bool, 3>> started;
+    auto frames = p.run(&started);
+    return ayexp::export_ay(frames, started, p.title, j.out_base, xm, midi, ay_export_options("pt3", FPS));
+}
+
+EXPORT_DEFINE("pt3", "pt32xm-midi-wav.py", true, nullptr, "Export selected to XM/MIDI (PT3)...", pt3_export, "pt3")
 
 class PT3Plugin : public AYPluginBase
 {
@@ -453,7 +475,8 @@ public:
     static constexpr PluginInfo info = {N_("PT3 Decoder (ZX Spectrum)"), "pt3", about, &prefs};
 
     constexpr PT3Plugin() : AYPluginBase(info, InputInfo().with_exts(exts), "pt3") {}
-    bool init() { aud_config_set_defaults("pt3", defaults); return true; }
+    bool init() { aud_config_set_defaults("pt3", defaults); export_register(); return true; }
+    void cleanup() { export_unregister(); }
 
     bool read_tag(const char * filename, VFSFile &, Tuple & tuple, Index<char> *)
     {

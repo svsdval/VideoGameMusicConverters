@@ -375,3 +375,19 @@ automatically if `audacious-dev` is missing; SID needs the `libsidplayfp6` packa
 `audacious_gme/` -> `spc.so`, `nsf.so`, `vgm.so` (Game Music Emu from the installed `libgme0`; headers fetched automatically). Settings per plugin:
 voice/channel mute (SPC 8 voices, NSF/VGM 16 slots), tempo, stereo echo depth, treble/bass, channels mode, volume, accurate emulation,
 default length/fade. NSF/NSFE subtunes are supported. The stock `console` plugin handles the same formats; disable it if Audacious picks it first.
+
+### Export to XM / MIDI from Audacious
+Every plugin adds a playlist context-menu item "Export selected to XM/MIDI (<format>)..." that runs the matching `*2xm-midi-wav.py`
+converter of this repo on the selected tracks (subtunes of NSF/SID are exported as `name_N`). Per-plugin settings: write XM / MIDI,
+seconds to emulate (0 = the converter default), output folder (empty = next to the source file), converter scripts folder
+(defaults to the repo dir at build time) and the Python command (`python3`, needs numpy). Errors are shown in a dialog, success via `notify-send`.
+
+**Built-in converters (no Python):** PT3 and PSG export is implemented in C++ (`audacious_ay/ayexport.hpp`) and produces byte-identical
+XM/MIDI to `pt32xm-midi-wav.py` / `psg2xm-midi-wav.py` (checked with `cmp`). It is used by default (`Use the built-in converter`) and has extra
+settings: XM channel layout preset, transpose, XM volume scale. NSF export is also built in (`audacious_gme/nsfemu.hpp` = 6502 + APU emulator, `nsfexport.hpp` = converter): on the example files it gives
+the same `.mid` and the same `.xm` as `nsf2xm-midi-wav.py` byte for byte (only the hash-based names of PCM instruments differ, Python's `hash()` is random per run).
+SID export is built in as well (`audacious_sid/sidexport.hpp`: 6502 + frame register capture + XM/MIDI writers), byte-identical to
+`sid2xm-midi-wav.py` on `Devils_ReSIDence_3SID.sid` (XM and MIDI). USF export is built in too (`audacious_usf/usfexport.hpp`; lazyusf2 is built with `usf_tracer/usftrace.patch`): all 10 `examples/sparse*.miniusf`
+give byte-identical `.xm` and `.mid` to `usf2xm-midi-wav.py`, in ~3 s instead of ~20 s. VGM export is built in (`audacious_gme/vgmexport.hpp`, byte-identical to `vgm2xm-midi-wav.py` on the example file); FM instruments are rendered with
+libvgm: either in-process (`VGM_NATIVE=1 ./build.sh` in `audacious_gme/`, builds libvgm statically) or, by default, with the repo's `vgm_render/vgm2wav` binary (path in the plugin settings).
+Only SPC still calls its Python script.

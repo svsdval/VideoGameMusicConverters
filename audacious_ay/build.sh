@@ -5,7 +5,7 @@ set -euo pipefail
 HERE="$(cd "$(dirname "$0")" && pwd)"
 AUDINC="$("$HERE/../audacious_inc.sh")"
 for p in pt3 psg; do
-    g++ -std=c++17 -O2 -fPIC -shared -Wall $AUDINC $(pkg-config --cflags glib-2.0) \
+    g++ -std=c++17 -I"$HERE/../audacious_common" -DEXPORT_SCRIPT_DIR="\"$(cd "$HERE/.." && pwd)\"" -O2 -fPIC -shared -Wall $AUDINC $(pkg-config --cflags glib-2.0) \
         -o "$HERE/$p.so" "$HERE/$p.cc"
     echo "OK: $HERE/$p.so"
 done

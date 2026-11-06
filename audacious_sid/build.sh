@@ -21,7 +21,7 @@ else
         "$W/src/src/sidplayfp/sidversion.h.in" > "$W/inc/sidplayfp/sidversion.h"
     SIDINC="-I$W/inc"; SIDLIB="$LIB"
 fi
-g++ -std=c++17 -O2 -fPIC -shared -Wall $AUDINC $SIDINC $(pkg-config --cflags glib-2.0) \
+g++ -std=c++17 -I"$HERE/../audacious_common" -DEXPORT_SCRIPT_DIR="\"$(cd "$HERE/.." && pwd)\"" -O2 -fPIC -shared -Wall $AUDINC $SIDINC $(pkg-config --cflags glib-2.0) \
     -o "$HERE/sid.so" "$HERE/sid.cc" $SIDLIB
 echo "OK: $HERE/sid.so"
 if [ "${1:-}" = install ]; then

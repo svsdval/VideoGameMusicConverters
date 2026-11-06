@@ -1,5 +1,7 @@
 // Audacious 4.x input plugin: Nintendo 64 .usf / .miniusf
 // Рендер через lazyusf2 (тот же эмулятор, что использует usf2xm-midi-wav.py для WAV).
+#include "export.hpp"
+#include "usfexport.hpp"
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -17,6 +19,8 @@
 #include <libaudcore/preferences.h>
 
 extern "C" {
+void usf_trace_reset(void);
+extern FILE * usf_trace_f, * usf_trace_pcm;
 extern uint32_t usf_voice_mute_mask;    // патч voicemute.patch в lazyusf2 (rsp_hle/alist.c)
 #include "psflib.h"
 #include "usf/usf.h"
@@ -60,7 +64,13 @@ const PreferencesWidget widgets[] = {
                 WidgetBool("usf", "ignore_tags")),
     WidgetSpin(N_("Default length:"), WidgetInt("usf", "default_length"), {10, 3600, 10, N_("s")}),
     WidgetSpin(N_("Default fade-out:"), WidgetInt("usf", "default_fade"), {0, 60, 1, N_("s")}),
-    WidgetLabel(N_("Length/fade changes apply to the next track start."))};
+    WidgetLabel(N_("Length/fade changes apply to the next track start.")),
+    WidgetSeparator(),
+    EXPORT_WIDGETS("usf"),
+    WidgetCheck(N_("Use the built-in converter (no Python needed)"), WidgetBool("usf", "exp_builtin")),
+    WidgetSpin(N_("Make XM rows N times coarser (1 = auto grid):"), WidgetInt("usf", "exp_compact"), {1, 8, 1, ""}),
+    WidgetSpin(N_("Transpose note names:"), WidgetInt("usf", "exp_transpose"), {-48, 48, 1, N_("semitones")}),
+    WidgetLabel(N_("Do not play USF tracks while an export is running."))};
 
 const PluginPreferences prefs = {{widgets}};
 
@@ -74,7 +84,8 @@ const char * const defaults[] = {
     "voice25", "TRUE", "voice26", "TRUE", "voice27", "TRUE", "voice28", "TRUE",
     "voice29", "TRUE", "voice30", "TRUE", "voice31", "TRUE", "voice32", "TRUE",
     "output", "0", "gain", "100", "ignore_tags", "FALSE",
-    "default_length", "180", "default_fade", "5", nullptr};
+    "default_length", "180", "default_fade", "5", EXPORT_DEFAULTS,
+    "exp_builtin", "TRUE", "exp_compact", "1", "exp_transpose", "0", nullptr};
 
 uint32_t read_mute_mask()
 {
@@ -191,6 +202,76 @@ void apply_output(int16_t * buf, int n)
 
 } // namespace
 
+
+// Эмуляция с трассировкой аудио-микрокода -> встроенный конвертер в XM/MIDI.
+// Трассировка и маска голосов глобальны в lazyusf2: на время экспорта не проигрывайте USF в Audacious.
+static std::string usf_export(const exporter::Job & j, bool xm, bool midi)
+{
+    StringBuf uri = filename_to_uri(j.input.c_str());
+    Loaded T;
+    load_usf(uri, T, false);                      // только теги
+    double secs = aud_get_int("usf", "exp_seconds");
+    if (secs <= 0) secs = T.have_length ? T.length + T.fade : 120.0;
+    std::string title = !T.title.empty() ? T.title : !T.game.empty() ? T.game
+                                                    : j.out_base.substr(j.out_base.rfind('/') + 1);
+
+    Loaded L;
+    if (!load_usf(uri, L, true)) return "cannot load the file (is the .usflib next to it?)";
+    void * st = L.state;
+    usf_set_compare(st, L.compare);
+    usf_set_fifo_full(st, L.fifo_full);
+    usf_set_hle_audio(st, 1);
+
+    FILE * tf = tmpfile(), * pf = tmpfile();
+    if (!tf || !pf) { if (tf) fclose(tf); if (pf) fclose(pf); usf_shutdown(st); free(st); return "cannot create temp files"; }
+    usf_voice_mute_mask = 0;
+    usf_trace_reset();
+    usf_trace_f = tf;
+    usf_trace_pcm = pf;
+    int32_t rate = 0;
+    const char * err = usf_render(st, nullptr, 0, &rate);
+    if (!err)
+    {
+        fprintf(tf, "# rate %d\n", (int)rate);
+        int16_t buf[2048];
+        long total = (long)(secs * 44100);
+        while (total > 0 && !err)
+        {
+            int n = total > 1024 ? 1024 : (int)total;
+            err = usf_render_resampled(st, buf, n, 44100);
+            total -= n;
+        }
+    }
+    usf_trace_f = usf_trace_pcm = nullptr;
+    usf_shutdown(st);
+    free(st);
+    if (err) { fclose(tf); fclose(pf); return std::string("emulator error: ") + err; }
+
+    auto slurp = [](FILE * f) {
+        std::string out;
+        fflush(f);
+        rewind(f);
+        char b[65536];
+        size_t k;
+        while ((k = fread(b, 1, sizeof b, f)) > 0) out.append(b, k);
+        return out;
+    };
+    std::string text = slurp(tf);
+    std::string raw = slurp(pf);
+    fclose(tf);
+    fclose(pf);
+    std::vector<int16_t> pcm(raw.size() / 2);
+    memcpy(pcm.data(), raw.data(), pcm.size() * 2);
+
+    usfexp::Options o;
+    int cp = aud_get_int("usf", "exp_compact");
+    o.compact = cp > 0 ? cp : 1;
+    o.transpose = aud_get_int("usf", "exp_transpose");
+    return usfexp::convert(usfexp::parse_trace(text), pcm, j.out_base, title, xm, midi, o);
+}
+
+EXPORT_DEFINE("usf", "usf2xm-midi-wav.py", false, nullptr, "Export selected to XM/MIDI (USF)...", usf_export, "usf", "miniusf")
+
 class USFPlugin : public InputPlugin
 {
 public:
@@ -202,7 +283,8 @@ public:
     constexpr USFPlugin() : InputPlugin(info, InputInfo().with_exts(exts)) {}
 
     bool is_our_file(const char *, VFSFile &) { return false; }   // только по расширению
-    bool init() { aud_config_set_defaults("usf", defaults); return true; }
+    bool init() { aud_config_set_defaults("usf", defaults); export_register(); return true; }
+    void cleanup() { export_unregister(); }
     bool read_tag(const char * filename, VFSFile &, Tuple & tuple, Index<char> *);
     bool play(const char * filename, VFSFile &);
 };
