@@ -343,3 +343,35 @@ python3 pt32xm-midi-wav.py music.pt3 --midi --channel-map split-all --raw-notes
 python3 pt32xm-midi-wav.py music.pt3 --wav --wav-file output.wav --wav-volume 0.5
 python3 pt32xm-midi-wav.py *.pt3 --wav --midi                      # пакетно
 ```
+
+## Audacious plugin: USF (N64)
+`audacious_usf/` - input plugin for [Audacious](https://audacious-media-player.org/) 4.x, plays `.usf` / `.miniusf` directly
+(lazyusf2 + psflib, the same emulator as `usf2xm-midi-wav.py` uses for WAV; PSF tags, length/fade, seeking).
+```bash
+cd audacious_usf
+./build.sh            # builds usf.so (clones lazyusf2/psflib and, if audacious-dev is missing, the Audacious headers)
+./build.sh install    # copies usf.so into the Audacious Input plugin dir (sudo)
+```
+Needs g++, make, git, zlib and glib dev packages. `.usflib` must lie next to the `.miniusf`.
+
+### More Audacious plugins
+| Dir | Plugin | Formats | Engine |
+|---|---|---|---|
+| `audacious_ay/` | `pt3.so`, `psg.so` | ZX Spectrum `.pt3`, `.psg` | C++ ports of the PT3 player and the AY emulator from `pt32xm-midi-wav.py` / `psg2xm-midi-wav.py` |
+| `audacious_sid/` | `sid.so` | C64 `.sid` (subtunes, multi-SID) | installed `libsidplayfp` (reSIDfp), not the Python SID model |
+
+Each dir has `./build.sh` and `./build.sh install` (sudo, copies into the Audacious `Input` plugin dir). Audacious headers are fetched
+automatically if `audacious-dev` is missing; SID needs the `libsidplayfp6` package (its headers are fetched too).
+
+### Plugin settings (Settings -> Plugins -> Input -> ... -> gear icon)
+* **PT3 / PSG:** per channel A/B/C - output, tone, noise, envelope on/off (live); AY/YM chip, ABC/ACB/mono layout, clock, volume.
+  PT3 also: mute samples by number (`3, 5, 10-12`) and disable ornaments (applied at track start).
+* **SID:** mute each of the 3 voices of up to 3 SID chips (live); SID/C64 model, filter, digi boost, sampling, volume, default length/fade.
+* **USF:** mute "voice slots" 1-32 (the N-th envelope-mixer call per RSP audio task; patched into lazyusf2 via `audacious_usf/voicemute.patch`),
+  mono / swap / single channel output, volume, default length/fade. N64 games have no fixed channels, so a slot is whatever voice the game
+  engine allocated to that position.
+
+### SPC / NSF / VGM plugins
+`audacious_gme/` -> `spc.so`, `nsf.so`, `vgm.so` (Game Music Emu from the installed `libgme0`; headers fetched automatically). Settings per plugin:
+voice/channel mute (SPC 8 voices, NSF/VGM 16 slots), tempo, stereo echo depth, treble/bass, channels mode, volume, accurate emulation,
+default length/fade. NSF/NSFE subtunes are supported. The stock `console` plugin handles the same formats; disable it if Audacious picks it first.

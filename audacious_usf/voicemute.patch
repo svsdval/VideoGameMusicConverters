@@ -1,0 +1,68 @@
+diff --git a/rsp_hle/alist.c b/rsp_hle/alist.c
+index 6982bbd..4a398d2 100644
+--- a/rsp_hle/alist.c
++++ b/rsp_hle/alist.c
+@@ -40,6 +40,16 @@ struct ramp_t
+     int64_t target;
+ };
+ 
++/* ---- voice mute (Audacious plugin): N-й вызов envmix за задачу = слот голоса N ---- */
++uint32_t usf_voice_mute_mask = 0;
++static unsigned usf_voice_idx = 0;
++void usf_voice_reset(void) { usf_voice_idx = 0; }
++static int usf_voice_muted(void)
++{
++    unsigned i = usf_voice_idx++;
++    return i < 32 && ((usf_voice_mute_mask >> i) & 1);
++}
++
+ /* local functions */
+ static void swap(int16_t **a, int16_t **b)
+ {
+@@ -275,6 +285,7 @@ void alist_envmix_exp(
+         const int32_t *rate,
+         uint32_t address)
+ {
++    if (usf_voice_muted()) return;
+     size_t n = (aux) ? 4 : 2;
+ 
+     const int16_t* const in = (int16_t*)(hle->alist_buffer + dmemi);
+@@ -379,6 +390,7 @@ void alist_envmix_ge(
+         const int32_t *rate,
+         uint32_t address)
+ {
++    if (usf_voice_muted()) return;
+     unsigned k;
+     size_t n = (aux) ? 4 : 2;
+ 
+@@ -457,6 +469,7 @@ void alist_envmix_lin(
+         const int32_t *rate,
+         uint32_t address)
+ {
++    if (usf_voice_muted()) return;
+     size_t k;
+     struct ramp_t ramps[2];
+     int16_t save_buffer[40];
+@@ -531,6 +544,7 @@ void alist_envmix_nead(
+         uint16_t *env_steps,
+         const int16_t *xors)
+ {
++    if (usf_voice_muted()) return;
+     int16_t *in = (int16_t*)(hle->alist_buffer + dmemi);
+     int16_t *dl = (int16_t*)(hle->alist_buffer + dmem_dl);
+     int16_t *dr = (int16_t*)(hle->alist_buffer + dmem_dr);
+diff --git a/rsp_hle/hle.c b/rsp_hle/hle.c
+index 4e65113..0849fb8 100644
+--- a/rsp_hle/hle.c
++++ b/rsp_hle/hle.c
+@@ -106,8 +106,10 @@ void hle_init(struct hle_t* hle,
+     hle->user_defined = user_defined;
+ }
+ 
++void usf_voice_reset(void);
+ void hle_execute(struct hle_t* hle)
+ {
++    usf_voice_reset();
+     uint32_t uc_start = *dmem_u32(hle, TASK_UCODE);
+     uint32_t uc_dstart = *dmem_u32(hle, TASK_UCODE_DATA);
+     uint32_t uc_dsize = *dmem_u32(hle, TASK_UCODE_DATA_SIZE);
