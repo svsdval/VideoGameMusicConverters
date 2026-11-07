@@ -11,9 +11,11 @@ usf_pyemu - эмулятор Nintendo 64 для USF/miniusf на чистом Py
   * интерпретатор MIPS R4300i: целочисленные и 64-битные команды, COP0 (с TLB и исключениями),
     COP1 (FPU), отложенные переходы, учёт Count как в mupen (по переходам), пропуск холостых циклов;
   * система: RDRAM, DMEM/IMEM RSP, регистры MI/VI/AI/PI/SI/SP/DP/RI, очередь событий и прерывания;
-  * RSP: HLE аудио-микрокода ABI1 ("audio ABI", самый частый), как в lazyusf2 при enable_hle_audio=1.
-    Графические и неизвестные задачи только завершаются (как в lazyusf2). Другие аудио-ABI
-    (ABI2/ABI3/MusyX) не поддерживаются - в трассе будет только строка "# ucode".
+  * RSP: HLE аудио-микрокодов как в lazyusf2 при enable_hle_audio=1: ABI1 ("audio ABI", самый частый),
+    ABI2 ("nead": Zelda, Mario Kart, Star Fox, F-Zero X, ...), ABI3 ("naudio": Banjo, DK64, Perfect Dark,
+    Conker, ...; MP3-команды пропускаются) и MusyX v1/v2 (007 TWINE, Rogue Squadron, Indiana Jones, ...).
+    Порты ABI2/ABI3 сверены с C-реализацией lazyusf2 на случайных alist-программах; MusyX сверен
+    по трассе. Графические и неизвестные задачи только завершаются (как в lazyusf2).
 
 Скорость: порядка 1 млн инструкций N64 в секунду (нативный lazyusf2 - сотни миллионов), на практике
 в несколько раз медленнее реального времени.
@@ -2796,7 +2798,1157 @@ def _align(x, a):
     return (x + a - 1) & ~(a - 1)
 
 
-class Hle:
+class AlistExtra:
+    """Команды аудио-микрокодов ABI2 ("nead") и ABI3 ("naudio") + общие примитивы alist.c
+    (порт rsp_hle lazyusf2: alist.c, alist_naudio.c, alist_nead.c).  Адресация DMEM - логическая
+    (big-endian), как в остальном Hle."""
+
+    # ---------- общие примитивы ----------
+    def a_clear(self, dmem, count):
+        buf = self.buf
+        for i in range(count):
+            buf[(dmem + i) & 0xFFF] = 0
+
+    def a_load(self, dmem, address, count):
+        dmem &= ~3 & 0xFFF
+        address &= ~7
+        n = min(_align(count, 8), 0x1000 - dmem)
+        if n > 0:
+            self.buf[dmem:dmem + n] = self.m.dram_read_bytes(address & 0xFFFFFF, n)
+
+    def a_save(self, dmem, address, count):
+        dmem &= ~3 & 0xFFF
+        address &= ~7
+        n = min(_align(count, 8), 0x1000 - dmem)
+        if n > 0:
+            self.m.dram_write_bytes(address & 0xFFFFFF, bytes(self.buf[dmem:dmem + n]))
+
+    def a_move(self, dmemo, dmemi, count):
+        buf = self.buf
+        for i in range(count):
+            buf[(dmemo + i) & 0xFFF] = buf[(dmemi + i) & 0xFFF]
+
+    def a_copy_every_other(self, dmemo, dmemi, count):
+        s = self.s
+        for _ in range(count):
+            s[(dmemo >> 1) & 0x7FF] = s[(dmemi >> 1) & 0x7FF]
+            dmemo += 2
+            dmemi += 4
+
+    def a_repeat64(self, dmemo, dmemi, count):
+        chunk = bytes(self.buf[(dmemi + i) & 0xFFF] for i in range(128))
+        for _ in range(count):
+            for i in range(128):
+                self.buf[(dmemo + i) & 0xFFF] = chunk[i]
+            dmemo += 128
+
+    def a_copy_blocks(self, dmemo, dmemi, block_size, count):
+        buf = self.buf
+        block_left = count
+        while True:
+            bytes_left = block_size
+            while True:
+                chunk = bytes(buf[(dmemi + i) & 0xFFF] for i in range(0x20))
+                for i in range(0x20):
+                    buf[(dmemo + i) & 0xFFF] = chunk[i]
+                bytes_left -= 0x20
+                dmemi += 0x20
+                dmemo += 0x20
+                if bytes_left <= 0:
+                    break
+            block_left -= 1
+            if block_left <= 0:
+                break
+
+    def a_interleave(self, dmemo, left, right, count):
+        n = count >> 2
+        if n <= 0:
+            return
+        s = self.s
+        L = s[((left >> 1) + np.arange(n * 2)) & 0x7FF].copy()
+        Rr = s[((right >> 1) + np.arange(n * 2)) & 0x7FF].copy()
+        out = np.empty(n * 4, dtype=np.int16)
+        out[0::2] = L
+        out[1::2] = Rr
+        s[((dmemo >> 1) + np.arange(n * 4)) & 0x7FF] = out
+
+    def a_mix(self, dmemo, dmemi, count, gain):
+        n = count >> 1
+        if n <= 0:
+            return
+        s = self.s
+        src = s[((dmemi >> 1) + np.arange(n)) & 0x7FF].astype(np.int64)
+        idx = ((dmemo >> 1) + np.arange(n)) & 0x7FF
+        cur = s[idx].astype(np.int64)
+        s[idx] = np.clip(cur + ((src * gain) >> 15), -32768, 32767)
+
+    def a_add(self, dmemo, dmemi, count):
+        n = count >> 1
+        if n <= 0:
+            return
+        s = self.s
+        src = s[((dmemi >> 1) + np.arange(n)) & 0x7FF].astype(np.int64)
+        idx = ((dmemo >> 1) + np.arange(n)) & 0x7FF
+        cur = s[idx].astype(np.int64)
+        s[idx] = np.clip(cur + src, -32768, 32767)
+
+    def a_multq44(self, dmem, count, gain):
+        n = count >> 1
+        if n <= 0:
+            return
+        s = self.s
+        idx = ((dmem >> 1) + np.arange(n)) & 0x7FF
+        cur = s[idx].astype(np.int64)
+        s[idx] = np.clip((cur * gain) >> 4, -32768, 32767)
+
+    def a_resample_zoh(self, dmemo, dmemi, count, pitch, pitch_accu):
+        ipos = dmemi >> 1
+        opos = dmemo >> 1
+        s = self.s
+        for _ in range(count >> 1):
+            s[opos & 0x7FF] = s[ipos & 0x7FF]
+            opos += 1
+            pitch_accu += pitch
+            ipos += pitch_accu >> 16
+            pitch_accu &= 0xFFFF
+
+    def a_overload(self, dmem, count, gain, attenuation):
+        s = self.s
+        pos = dmem >> 1
+        for _ in range(count):
+            accu = _clamp16(int(s[pos & 0x7FF]) * gain)
+            s[pos & 0x7FF] = _s16((accu * attenuation) >> 16)
+            pos += 1
+
+    def a_envmix_nead(self, swap_wet_lr, dmem_dl, dmem_dr, dmem_wl, dmem_wr, dmemi, count, xors):
+        s = self.s
+        ev, es = self.env_values, self.env_steps
+        count = _align(count, 8)
+        if swap_wet_lr:
+            dmem_wl, dmem_wr = dmem_wr, dmem_wl
+        ib, dl, dr, wl, wr = dmemi >> 1, dmem_dl >> 1, dmem_dr >> 1, dmem_wl >> 1, dmem_wr >> 1
+        x0, x1, x2, x3 = xors
+        while count != 0:
+            e0, e1, e2 = ev
+            for i in range(8):
+                v = int(s[(ib + i) & 0x7FF])
+                l = _s16(((v * e0) >> 16) ^ x0)
+                r = _s16(((v * e1) >> 16) ^ x1)
+                l2 = _s16(((l * e2) >> 16) ^ x2)
+                r2 = _s16(((r * e2) >> 16) ^ x3)
+                j = (dl + i) & 0x7FF
+                s[j] = _clamp16(int(s[j]) + l)
+                j = (dr + i) & 0x7FF
+                s[j] = _clamp16(int(s[j]) + r)
+                j = (wl + i) & 0x7FF
+                s[j] = _clamp16(int(s[j]) + l2)
+                j = (wr + i) & 0x7FF
+                s[j] = _clamp16(int(s[j]) + r2)
+            ev[0] = (e0 + es[0]) & 0xFFFF
+            ev[1] = (e1 + es[1]) & 0xFFFF
+            ev[2] = (e2 + es[2]) & 0xFFFF
+            dl += 8
+            dr += 8
+            wl += 8
+            wr += 8
+            ib += 8
+            count -= 8
+
+    @staticmethod
+    def _ramp(value, step, target, n):
+        """n шагов alist ramp_step: возвращает (массив int16 (value>>16), value, step)."""
+        k = np.arange(1, n + 1, dtype=np.int64)
+        if step == 0:
+            if value <= target:
+                value = target
+            vals = np.full(n, value, dtype=np.int64)
+            return (vals >> 16).astype(np.int16), value, 0
+        vals = value + step * k
+        if step < 0:
+            reached = vals <= target
+        else:
+            reached = vals >= target
+        if reached.any():
+            first = int(np.argmax(reached))
+            vals[first:] = target
+            step = 0
+        if n:
+            value = int(vals[-1])
+        return (vals >> 16).astype(np.int16), value, step
+
+    def a_envmix_lin(self, init, dmem_dl, dmem_dr, dmem_wl, dmem_wr, dmemi, count, dry, wet,
+                     vol, target, rate, address):
+        """envmix 'lin' (ABI3).  Возвращает (value0, value1, target0, target1, dry) для трассы."""
+        raw = self.m.dram_read_bytes(address & 0xFFFFFF, 80)
+        wd = list(struct.unpack('>20I', raw))
+        sw = lambda x: x - (1 << 32) if x & 0x80000000 else x
+        div8 = lambda a: -((-a) // 8) if a < 0 else a // 8
+        if init:
+            st = [div8(rate[0]), div8(rate[1])]
+            vl = [vol[0] << 16, vol[1] << 16]
+            tg = [target[0] << 16, target[1] << 16]
+        else:
+            wet = _s16(wd[0])
+            dry = _s16(wd[1])
+            tg = [_s16(wd[2]) << 16, _s16(wd[3]) << 16]
+            st = [sw(wd[4]), sw(wd[5])]
+            vl = [sw(wd[8]), sw(wd[9])]
+        n = count >> 1
+        s = self.s
+        if n > 0:
+            lv, vl[0], st[0] = self._ramp(vl[0], st[0], tg[0], n)
+            rv, vl[1], st[1] = self._ramp(vl[1], st[1], tg[1], n)
+            L = lv.astype(np.int64)
+            Rr = rv.astype(np.int64)
+            ib = dmemi >> 1
+            src = s[(ib + np.arange(n)) & 0x7FF].astype(np.int64)
+            gains = [np.clip((L * dry + 0x4000) >> 15, -32768, 32767),
+                     np.clip((Rr * dry + 0x4000) >> 15, -32768, 32767),
+                     np.clip((L * wet + 0x4000) >> 15, -32768, 32767),
+                     np.clip((Rr * wet + 0x4000) >> 15, -32768, 32767)]
+            dst = [dmem_dl, dmem_dr, dmem_wl, dmem_wr]
+            for k in range(4):
+                idx = ((dst[k] >> 1) + np.arange(n)) & 0x7FF
+                cur = s[idx].astype(np.int64)
+                s[idx] = np.clip(cur + ((src * gains[k]) >> 15), -32768, 32767)
+        wd[0] = (wd[0] & 0xFFFF0000) | (wet & 0xFFFF)
+        wd[1] = (wd[1] & 0xFFFF0000) | (dry & 0xFFFF)
+        wd[2] = (wd[2] & 0xFFFF0000) | ((tg[0] >> 16) & 0xFFFF)
+        wd[3] = (wd[3] & 0xFFFF0000) | ((tg[1] >> 16) & 0xFFFF)
+        wd[4] = st[0] & M32
+        wd[5] = st[1] & M32
+        wd[8] = vl[0] & M32
+        wd[9] = vl[1] & M32
+        self.m.dram_write_bytes(address & 0xFFFFFF, struct.pack('>20I', *wd))
+        return vl[0] >> 16, vl[1] >> 16, tg[0] >> 16, tg[1] >> 16, dry
+
+    def a_polef(self, init, dmemo, dmemi, count, gain, address):
+        count = _align(count, 16)
+        if count == 0:
+            return
+        s = self.s
+        h1 = self.table[0:8]
+        h2 = self.table[8:16]
+        if init:
+            l1 = l2 = 0
+        else:
+            l1 = _s16(self.dram_u16(address + 4))
+            l2 = _s16(self.dram_u16(address + 6))
+        h2_before = list(h2)
+        for i in range(8):
+            self.table[8 + i] = _s16((h2[i] * gain) >> 14)
+        h2 = self.table[8:16]
+        di = dmemi >> 1
+        dst = dmemo >> 1
+        last = None
+        while count > 0:
+            frame = [int(s[(di + i) & 0x7FF]) for i in range(8)]
+            di += 8
+            outs = [0] * 8
+            for i in range(8):
+                accu = frame[i] * gain
+                accu += h1[i] * l1 + h2_before[i] * l2
+                for j in range(i):
+                    accu += h2[j] * frame[i - 1 - j]
+                outs[i] = _clamp16(accu >> 14)
+            for i in range(8):
+                s[(dst + i) & 0x7FF] = outs[i]
+            l1 = outs[6]
+            l2 = outs[7]
+            last = outs
+            dst += 8
+            count -= 16
+        for i in range(4):
+            self.dram_set_u16(address + 2 * i, last[4 + i])
+
+    def a_iirf(self, init, dmemo, dmemi, count, address):
+        t = self.table
+        vmulf = lambda a, b: (a * b + 0x4000) >> 15
+        count = _align(count, 16)
+        s = self.s
+        frame = [0] * 8
+        ibuf = [0] * 4
+        if not init:
+            frame[6] = _s16(self.dram_u16(address + 4))
+            frame[7] = _s16(self.dram_u16(address + 6))
+            ibuf[1] = _s16(self.dram_u16(address + 8))
+            ibuf[2] = _s16(self.dram_u16(address + 10))
+        index = 7
+        dst = dmemo >> 1
+        di = dmemi >> 1
+        prev = vmulf(t[9], frame[6]) * 2
+        while True:
+            for i in range(8):
+                ibuf[index & 3] = int(s[di & 0x7FF])
+                accu = prev + vmulf(t[0], ibuf[index & 3]) + vmulf(t[1], ibuf[(index - 1) & 3]) \
+                    + vmulf(t[0], ibuf[(index - 2) & 3])
+                accu += vmulf(t[8], frame[index]) * 2
+                prev = vmulf(t[9], frame[index]) * 2
+                frame[i] = _s16(accu)
+                s[(dst + i) & 0x7FF] = frame[i]
+                index = (index + 1) & 7
+                di += 1
+            dst += 8
+            count -= 0x10
+            if count <= 0:
+                break
+        self.dram_set_u16(address + 4, frame[6])
+        self.dram_set_u16(address + 6, frame[7])
+        self.dram_set_u16(address + 8, ibuf[(index - 2) & 3])
+        self.dram_set_u16(address + 10, ibuf[(index - 1) & 3])
+
+    def a_filter(self, dmem, count, address, lut):
+        """alist_filter (FILTER в Zelda/Yoshi): в C индексы int16* идут в порядке памяти хоста
+        (порядок полуслов внутри слова обратный), поэтому индекс k <-> логический k^1."""
+        def dram_hw(base, k):
+            return _s16(self.dram_u16(base + 2 * (k ^ 1)))
+
+        t6 = [dram_hw(lut[0], k) for k in range(8)]
+        t5 = [dram_hw(lut[1], k) for k in range(8)]
+        for x in range(8):
+            v = (t5[x] + t6[x]) >> 1
+            t5[x] = t6[x] = v
+        for x in range(8):
+            self.dram_set_u16(lut[1] + 2 * (x ^ 1), t5[x])
+            self.dram_set_u16(lut[0] + 2 * (x ^ 1), t6[x])
+        s = self.s
+        dm = dmem >> 1
+        in1 = [dram_hw(address, k) for k in range(8)]
+        pos = 0                                    # in2 = dm + pos (в полусловах, порядок хоста)
+        outbuff = []
+
+        # in2[k] (хост-порядок) = логический полуслово (pos + k) ^ 1
+        def in2(p, k):
+            return int(s[(dm + ((p + k) ^ 1)) & 0x7FF])
+        t = t6
+        for x in range(0, count, 16):
+            i2 = [in2(pos, k) for k in range(8)]
+            a = in1
+            v = [0] * 8
+            v[1] = a[0] * t[6] + a[3] * t[7] + a[2] * t[4] + a[5] * t[5] + a[4] * t[2] + a[7] * t[3] + a[6] * t[0] + i2[1] * t[1]
+            v[0] = a[3] * t[6] + a[2] * t[7] + a[5] * t[4] + a[4] * t[5] + a[7] * t[2] + a[6] * t[3] + i2[1] * t[0] + i2[0] * t[1]
+            v[3] = a[2] * t[6] + a[5] * t[7] + a[4] * t[4] + a[7] * t[5] + a[6] * t[2] + i2[1] * t[3] + i2[0] * t[0] + i2[3] * t[1]
+            v[2] = a[5] * t[6] + a[4] * t[7] + a[7] * t[4] + a[6] * t[5] + i2[1] * t[2] + i2[0] * t[3] + i2[3] * t[0] + i2[2] * t[1]
+            v[5] = a[4] * t[6] + a[7] * t[7] + a[6] * t[4] + i2[1] * t[5] + i2[0] * t[2] + i2[3] * t[3] + i2[2] * t[0] + i2[5] * t[1]
+            v[4] = a[7] * t[6] + a[6] * t[7] + i2[1] * t[4] + i2[0] * t[5] + i2[3] * t[2] + i2[2] * t[3] + i2[5] * t[0] + i2[4] * t[1]
+            v[7] = a[6] * t[6] + i2[1] * t[7] + i2[0] * t[4] + i2[3] * t[5] + i2[2] * t[2] + i2[5] * t[3] + i2[4] * t[0] + i2[7] * t[1]
+            v[6] = i2[1] * t[6] + i2[0] * t[7] + i2[3] * t[4] + i2[2] * t[5] + i2[5] * t[2] + i2[4] * t[3] + i2[7] * t[0] + i2[6] * t[1]
+            outbuff.extend(_s16((v[k] + 0x4000) >> 15) for k in range(8))
+            in1 = i2
+            pos += 8
+        # последние 8 входных полуслов (in2 - 8) -> DRAM (16 байт, сырая копия)
+        last_bytes = bytes(self.buf[((dm + pos - 8) * 2 + i) & 0xFFF] for i in range(16)) if pos >= 8 else bytes(16)
+        self.m.dram_write_bytes(address & 0xFFFFFF, last_bytes)
+        # outbuff (хост-порядок) -> DMEM
+        for k, v in enumerate(outbuff):
+            s[(dm + (k ^ 1)) & 0x7FF] = v
+
+    # ---------- общая часть трассы (A/R/E) ----------
+    def tr_adpcm(self, flags, inn, out, cnt, address):
+        self.adpcm_seen = 1
+        self.adpcm_init = flags & 1
+        if self.t is None:
+            return
+        ob = (out + 32) & 0xFFFF
+        off = -1
+        v = self.voice(address)
+        if flags & 1:
+            v[0] = v[1] = v[2] = 0
+        cum = v[0]
+        if not v[2]:
+            h = (2166136261 ^ self.cur_table) & M32
+            h = (h * 16777619) & M32
+            for i in range(16):
+                if i * 2 < cnt:
+                    h ^= self.sample(((ob & 0xFFF) >> 1) + i) & 0xFFFF
+                    h = (h * 16777619) & M32
+            v[1] = h
+            v[2] = 1
+        h = v[1]
+        if cum + cnt > self.cov_len(h) and self.cov_len(h) < 262144:
+            off = self.pcm_write_samples(ob, cnt // 2)
+            self.cov[h] = cum + cnt
+        self.t.append('A %u %u %u %u %x %x %x %d %d %u\n' % (
+            flags, inn, out, cnt, address, self.loop, h, cum, off, 1 if (cum + cnt) < 0x7FFFFFFF else 0))
+        v[0] += cnt
+
+    def tr_resample(self, flags, pitch, address, inn, out, count):
+        if self.t is None:
+            return
+        if (flags & A_INIT) and not self.adpcm_init:
+            v0 = self.voice((address - 0x40) & M32)
+            if v0[0] > 0:
+                v0[0] = 0
+                v0[2] = 0
+        if not self.adpcm_seen and self.last_load_cnt > 0:
+            cnt = self.last_load_cnt
+            ib = self.last_load_in
+            vaddr = (address - 0x40) & M32
+            v = self.voice(vaddr)
+            off = -1
+            if flags & A_INIT:
+                v[0] = v[1] = v[2] = 0
+            cum = v[0]
+            if not v[2]:
+                h = (2166136261 ^ 0x50434D00) & M32
+                h = (h * 16777619) & M32
+                for i in range(16):
+                    if i * 2 < cnt:
+                        h ^= self.sample(((ib & 0xFFF) >> 1) + i) & 0xFFFF
+                        h = (h * 16777619) & M32
+                v[1] = h
+                v[2] = 1
+            h = v[1]
+            if cum + cnt > self.cov_len(h) and self.cov_len(h) < 262144:
+                off = self.pcm_write_samples(ib, cnt // 2)
+                self.cov[h] = cum + cnt
+            self.t.append('A %u %u %u %u %x %x %x %d %d %u\n' % (flags & A_INIT, ib, 0, cnt, vaddr, 0, h, cum, off, 1))
+            v[0] += cnt
+        self.t.append('R %u %u %x %u %u %u\n' % (flags, pitch, address, inn, out, count))
+
+    def tr_envmix(self, flags, inn, out, count, v0, v1, t0, t1, dry, address):
+        self.adpcm_seen = 0
+        self.adpcm_init = 0
+        self.last_load_cnt = 0
+        if self.t is not None:
+            self.t.append('E %u %u %u %u %d %d %d %d %d %d %d %d %x\n' % (
+                flags, inn, out, count, v0, v1, t0, t1, 0, 0, dry, 0, address))
+
+    def tr_load(self, dmem, count, address):
+        self.tr('B %u %u %x\n' % (dmem, count, address))
+        self.last_load_in = dmem
+        self.last_load_cnt = count
+
+    # ---------- ABI3 (naudio) ----------
+    N3_COUNT = 0x170
+    N3_MAIN, N3_MAIN2 = 0x4F0, 0x660
+    N3_DRY_L, N3_DRY_R, N3_WET_L, N3_WET_R = 0x9D0, 0xB40, 0xCB0, 0xE20
+
+    def n3_noop(self, w1, w2):
+        pass
+
+    def n3_02b0(self, w1, w2):
+        self.rate[1] = _to_i32((self.rate[1] & 0xFFFF0000) | (w2 & 0xFFFF))
+
+    def n3_14(self, w1, w2):
+        flags = (w1 >> 16) & 0xFF
+        gain = w1 & 0xFFFF
+        address = w2 & 0xFFFFFF
+        dmem = self.N3_MAIN if (w2 >> 24) == 0 else self.N3_MAIN2
+        if self.table[0] == 0 and self.table[1] == 0:
+            self.a_polef(flags & A_INIT, dmem, dmem, self.N3_COUNT, gain, address)
+        else:
+            self.a_iirf(flags & A_INIT, dmem, dmem, self.N3_COUNT, address)
+
+    def n3_setvol(self, w1, w2):
+        flags = (w1 >> 16) & 0xFF
+        self.tr('V %08x %08x\n' % (w1, w2))
+        if flags & A_VOL:
+            if flags & A_LEFT:
+                self.vol[0] = _s16(w1)
+                self.dry = _s16(w2 >> 16)
+                self.wet = _s16(w2)
+            else:
+                self.target[1] = _s16(w1)
+                self.rate[1] = _to_i32(w2)
+        else:
+            self.target[0] = _s16(w1)
+            self.rate[0] = _to_i32(w2)
+
+    def n3_envmixer(self, w1, w2):
+        flags = (w1 >> 16) & 0xFF
+        address = w2 & 0xFFFFFF
+        self.vol[1] = _s16(w1)
+        v0, v1, t0, t1, dry = self.a_envmix_lin(
+            flags & A_INIT, self.N3_DRY_L, self.N3_DRY_R, self.N3_WET_L, self.N3_WET_R,
+            self.N3_MAIN, self.N3_COUNT, self.dry, self.wet, self.vol, self.target, self.rate, address)
+        self.tr_envmix(flags, self.N3_MAIN, self.N3_MAIN, self.N3_COUNT, v0, v1, t0, t1, dry, address)
+
+    def n3_clearbuff(self, w1, w2):
+        self.a_clear((w1 + self.N3_MAIN) & 0xFFFF, w2 & 0xFFF)
+
+    def n3_mixer(self, w1, w2):
+        self.a_mix((w2 + self.N3_MAIN) & 0xFFFF, ((w2 >> 16) + self.N3_MAIN) & 0xFFFF, self.N3_COUNT, _s16(w1))
+
+    def n3_loadbuff(self, w1, w2):
+        count = (w1 >> 12) & 0xFFF
+        dmem = ((w1 & 0xFFF) + self.N3_MAIN) & 0xFFFF
+        address = w2 & 0xFFFFFF
+        self.tr_load(dmem, count, address)
+        self.a_load(dmem, address, count)
+
+    def n3_savebuff(self, w1, w2):
+        count = (w1 >> 12) & 0xFFF
+        dmem = ((w1 & 0xFFF) + self.N3_MAIN) & 0xFFFF
+        address = w2 & 0xFFFFFF
+        self.tr('S %u %u %x\n' % (dmem, count, address))
+        self.a_save(dmem, address, count)
+
+    def n3_loadadpcm(self, w1, w2):
+        count = w1 & 0xFFFF
+        address = w2 & 0xFFFFFF
+        self.tr('T %x %u\n' % (address, count))
+        self.cur_table = address
+        for i in range(min(count >> 1, 128)):
+            self.table[i] = _s16(self.dram_u16(address + 2 * i))
+
+    def n3_dmemmove(self, w1, w2):
+        self.a_move(((w2 >> 16) + self.N3_MAIN) & 0xFFFF, (w1 + self.N3_MAIN) & 0xFFFF, ((w2 & 0xFFFF) + 3) & ~3)
+
+    def n3_setloop(self, w1, w2):
+        self.loop = w2 & 0xFFFFFF
+        self.tr('L %x\n' % self.loop)
+
+    def n3_adpcm(self, w1, w2):
+        address = w1 & 0xFFFFFF
+        flags = (w2 >> 28) & 0xF
+        count = (w2 >> 16) & 0xFFF
+        dmemi = (((w2 >> 12) & 0xF) + self.N3_MAIN) & 0xFFFF
+        dmemo = ((w2 & 0xFFF) + self.N3_MAIN) & 0xFFFF
+        cnt = (count + 0x1F) & ~0x1F
+        self.adpcm(flags & A_INIT, flags & A_LOOP, dmemo, dmemi, cnt, address)
+        self.tr_adpcm(flags, dmemi, dmemo, cnt, address)
+
+    def n3_resample(self, w1, w2):
+        address = w1 & 0xFFFFFF
+        flags = (w2 >> 30) & 3
+        pitch = (w2 >> 14) & 0xFFFF
+        dmemi = (((w2 >> 2) & 0xFFF) + self.N3_MAIN) & 0xFFFF
+        dmemo = self.N3_MAIN2 if (w2 & 3) else self.N3_MAIN
+        self.tr_resample(flags, pitch, address, dmemi, dmemo, self.N3_COUNT)
+        self.resample(flags & A_INIT, dmemo, dmemi, self.N3_COUNT, pitch << 1, address)
+
+    def n3_interleave(self, w1, w2):
+        self.a_interleave(self.N3_MAIN, self.N3_DRY_L, self.N3_DRY_R, self.N3_COUNT)
+
+    def n3_overload(self, w1, w2):
+        self.a_overload((w1 & 0xFFF) + self.N3_MAIN, self.N3_COUNT, _s16(w2), (w2 >> 16) & 0xFFFF)
+
+    def n3_table(self, variant):
+        n, ad, cl, ev = self.n3_noop, self.n3_adpcm, self.n3_clearbuff, self.n3_envmixer
+        lb, rs, sb = self.n3_loadbuff, self.n3_resample, self.n3_savebuff
+        sv, dm, la, mx = self.n3_setvol, self.n3_dmemmove, self.n3_loadadpcm, self.n3_mixer
+        il, sl = self.n3_interleave, self.n3_setloop
+        if variant in ('mp3', 'cbfd'):
+            return [self.n3_overload, ad, cl, ev, lb, rs, sb, n, n, sv, dm, la, mx, il, self.n3_14, sl]
+        f7 = mx if variant == 'dk' else n
+        return [n, ad, cl, ev, lb, rs, sb, f7, f7, sv, dm, la, mx, il, self.n3_02b0, sl]
+
+    # ---------- ABI2 (nead) ----------
+    def n2_setbuff(self, w1, w2):
+        self.inn = w1 & 0xFFFF
+        self.out = (w2 >> 16) & 0xFFFF
+        self.count = w2 & 0xFFFF
+
+    def n2_adpcm(self, w1, w2):
+        flags = (w1 >> 16) & 0xFF
+        address = w2 & 0xFFFFFF
+        cnt = (self.count + 0x1F) & ~0x1F
+        self.adpcm(flags & 1, flags & 2, self.out, self.inn, cnt, address, bool(flags & 4))
+        self.tr_adpcm(flags, self.inn, self.out, cnt, address)
+
+    def n2_clearbuff(self, w1, w2):
+        count = w2 & 0xFFF
+        if count:
+            self.a_clear(w1 & 0xFFFF, count)
+
+    def n2_loadbuff(self, w1, w2):
+        count = (w1 >> 12) & 0xFFF
+        dmem = w1 & 0xFFF
+        address = w2 & 0xFFFFFF
+        self.tr_load(dmem, count, address)
+        self.a_load(dmem, address, count)
+
+    def n2_savebuff(self, w1, w2):
+        count = (w1 >> 12) & 0xFFF
+        dmem = w1 & 0xFFF
+        address = w2 & 0xFFFFFF
+        self.tr('S %u %u %x\n' % (dmem, count, address))
+        self.a_save(dmem, address, count)
+
+    def n2_mixer(self, w1, w2):
+        self.a_mix(w2 & 0xFFFF, (w2 >> 16) & 0xFFFF, (w1 >> 12) & 0xFF0, _s16(w1))
+
+    def n2_resample(self, w1, w2):
+        flags = (w1 >> 16) & 0xFF
+        pitch = w1 & 0xFFFF
+        address = w2 & 0xFFFFFF
+        cnt = (self.count + 0xF) & ~0xF
+        self.tr_resample(flags, pitch, address, self.inn, self.out, self.count)
+        self.resample(flags & 1, self.out, self.inn, cnt, pitch << 1, address)
+
+    def n2_resample_zoh(self, w1, w2):
+        self.a_resample_zoh(self.out, self.inn, self.count, (w1 & 0xFFFF) << 1, w2 & 0xFFFF)
+
+    def n2_dmemmove(self, w1, w2):
+        count = w2 & 0xFFFF
+        if count:
+            self.a_move((w2 >> 16) & 0xFFFF, w1 & 0xFFFF, (count + 3) & ~3)
+
+    def n2_envsetup1_mk(self, w1, w2):
+        self.env_values[2] = (w1 >> 8) & 0xFF00
+        self.env_steps[2] = 0
+        self.env_steps[0] = (w2 >> 16) & 0xFFFF
+        self.env_steps[1] = w2 & 0xFFFF
+
+    def n2_envsetup1(self, w1, w2):
+        self.env_values[2] = (w1 >> 8) & 0xFF00
+        self.env_steps[2] = w1 & 0xFFFF
+        self.env_steps[0] = (w2 >> 16) & 0xFFFF
+        self.env_steps[1] = w2 & 0xFFFF
+
+    def n2_envsetup2(self, w1, w2):
+        self.env_values[0] = (w2 >> 16) & 0xFFFF
+        self.env_values[1] = w2 & 0xFFFF
+
+    def _n2_env(self, w1, w2, mk):
+        dmemi = (w1 >> 12) & 0xFF0
+        count = (w1 >> 8) & 0xFF
+        dl, dr = (w2 >> 20) & 0xFF0, (w2 >> 12) & 0xFF0
+        wl, wr = (w2 >> 4) & 0xFF0, (w2 << 4) & 0xFF0
+        if mk:
+            swap = False
+            x2 = x3 = 0
+        else:
+            swap = bool((w1 >> 4) & 1)
+            x2 = (-((w1 & 0x8) >> 1)) & 0xFFFF
+            x3 = (-((w1 & 0x4) >> 1)) & 0xFFFF
+        x0 = (-((w1 & 0x2) >> 1)) & 0xFFFF
+        x1 = (-(w1 & 0x1)) & 0xFFFF
+        # трасса: коэффициенты до применения (затем они сдвигаются шагами)
+        ev0, ev1 = self.env_values[0], self.env_values[1]
+        steps = _align(count, 8) // 8
+        t0 = (ev0 + self.env_steps[0] * steps) & 0xFFFF
+        t1 = (ev1 + self.env_steps[1] * steps) & 0xFFFF
+        self.a_envmix_nead(swap, dl, dr, wl, wr, dmemi, count, (x0, x1, x2, x3))
+        # 16-битная огибающая 0..65535 -> шкала ABI1 (32768 = 1.0)
+        self.tr_envmix(0, dmemi, dl, count, ev0 >> 1, ev1 >> 1, t0 >> 1, t1 >> 1, 32768, 0)
+
+    def n2_envmixer_mk(self, w1, w2):
+        self._n2_env(w1, w2, True)
+
+    def n2_envmixer(self, w1, w2):
+        self._n2_env(w1, w2, False)
+
+    def n2_duplicate(self, w1, w2):
+        self.a_repeat64(w2 >> 16 & 0xFFFF, w1 & 0xFFFF, (w1 >> 16) & 0xFF)
+
+    def n2_interl(self, w1, w2):
+        self.a_copy_every_other(w2 & 0xFFFF, (w2 >> 16) & 0xFFFF, w1 & 0xFFFF)
+
+    def n2_interleave_mk(self, w1, w2):
+        if self.count == 0:
+            return
+        self.a_interleave(self.out, (w2 >> 16) & 0xFFFF, w2 & 0xFFFF, self.count)
+
+    def n2_interleave(self, w1, w2):
+        self.a_interleave(w1 & 0xFFFF, (w2 >> 16) & 0xFFFF, w2 & 0xFFFF, (w1 >> 12) & 0xFF0)
+
+    def n2_addmixer(self, w1, w2):
+        self.a_add(w2 & 0xFFFF, (w2 >> 16) & 0xFFFF, (w1 >> 12) & 0xFF0)
+
+    def n2_hilogain(self, w1, w2):
+        g = (w1 >> 16) & 0xFF
+        self.a_multq44((w2 >> 16) & 0xFFFF, w1 & 0xFFF, g - 256 if g & 0x80 else g)
+
+    def n2_filter(self, w1, w2):
+        flags = (w1 >> 16) & 0xFF
+        address = w2 & 0xFFFFFF
+        if flags > 1:
+            self.filter_count = w1 & 0xFFFF
+            self.filter_lut[0] = address
+        else:
+            self.filter_lut[1] = address + 0x10
+            self.a_filter(w1 & 0xFFFF, self.filter_count, address, self.filter_lut)
+
+    def n2_nead16(self, w1, w2):
+        self.a_copy_blocks((w2 >> 16) & 0xFFFF, w1 & 0xFFFF, w2 & 0xFFFF, (w1 >> 16) & 0xFF)
+
+    def n2_polef(self, w1, w2):
+        if self.count == 0:
+            return
+        self.a_polef((w1 >> 16) & 1, self.out, self.inn, self.count, w1 & 0xFFFF, w2 & 0xFFFFFF)
+
+    def n2_table(self, variant):
+        n = self.n3_noop
+        U = n                                    # UNKNOWN: в C только предупреждение
+        ad, cl = self.n2_adpcm, self.n2_clearbuff
+        rs, zoh = self.n2_resample, self.n2_resample_zoh
+        sb = self.n2_setbuff
+        dm, la, mx = self.n2_dmemmove, self.n3_loadadpcm_nead, self.n2_mixer
+        sl, nd16, il = self.n2_setloop, self.n2_nead16, self.n2_interl
+        lb, sv = self.n2_loadbuff, self.n2_savebuff
+        e2 = self.n2_envsetup2
+        pol, ilm, ili = self.n2_polef, self.n2_interleave_mk, self.n2_interleave
+        am, hl, dup, flt = self.n2_addmixer, self.n2_hilogain, self.n2_duplicate, self.n2_filter
+        seg = n
+        if variant == 'mk':
+            return [n, ad, cl, n, n, rs, n, seg, sb, n, dm, la, mx, ilm, pol, sl,
+                    nd16, il, self.n2_envsetup1_mk, self.n2_envmixer_mk, lb, sv, e2, n,
+                    n, n, n, n, n, n, n, n]
+        e1, em = self.n2_envsetup1, self.n2_envmixer
+        if variant == 'sf':
+            return [n, ad, cl, n, am, rs, zoh, n, sb, n, dm, la, mx, ilm, pol, sl,
+                    nd16, il, e1, em, lb, sv, e2, n, hl, U, dup, n, n, n, n, n]
+        if variant == 'sfj':
+            return [n, ad, cl, n, am, rs, zoh, n, sb, n, dm, la, mx, ilm, pol, sl,
+                    nd16, il, e1, em, lb, sv, e2, U, hl, U, dup, n, n, n, n, n]
+        if variant == 'fz':
+            return [U, ad, cl, n, am, rs, n, n, sb, n, dm, la, mx, ili, n, sl,
+                    nd16, il, e1, em, lb, sv, e2, U, n, U, dup, n, n, n, n, n]
+        if variant == 'wrjb':
+            return [n, ad, cl, U, am, rs, zoh, n, sb, n, dm, la, mx, ili, n, sl,
+                    nd16, il, e1, em, lb, sv, e2, U, hl, U, dup, flt, n, n, n, n]
+        # семейство Zelda/Yoshi (0x18 команд)
+        zero = {'ys': U, '1080': U, 'oot': U, 'mm': U, 'mmb': n, 'ac': U}[variant]
+        three = {'ys': U, '1080': U, 'oot': U, 'mm': n, 'mmb': n, 'ac': n}[variant]
+        return [zero, ad, cl, three, am, rs, zoh, flt, sb, dup, dm, la, mx, ili, hl, sl,
+                nd16, il, e1, em, lb, sv, e2, U]
+
+    def n3_loadadpcm_nead(self, w1, w2):
+        count = w1 & 0xFFFF
+        address = w2 & 0xFFFFFF
+        self.tr('T %x %u\n' % (address, count))
+        self.cur_table = address
+        for i in range(min(count >> 1, 128)):
+            self.table[i] = _s16(self.dram_u16(address + 2 * i))
+
+    def n2_setloop(self, w1, w2):
+        self.loop = w2 & 0xFFFFFF
+        self.tr('L %x\n' % self.loop)
+
+    # ---------- запуск alist ----------
+    def run_alist(self, table):
+        m = self.m
+        if self.t is not None:
+            self.t.append('F\n')
+        sp = m.spmem
+        data_ptr = sp[0xFF0 >> 2]
+        data_size = sp[0xFF4 >> 2]
+        raw = m.dram_read_bytes(data_ptr & 0xFFFFFF, data_size & ~7)
+        words = struct.unpack('>%dI' % (len(raw) // 4), raw)
+        size = len(table)
+        for i in range(0, len(words), 2):
+            w1, w2 = words[i], words[i + 1]
+            acmd = (w1 >> 24) & 0x7F
+            if acmd < size:
+                table[acmd](w1, w2)
+        m.rsp_break(0x200)
+
+
+class MusyxMixin:
+    """MusyX v1/v2 (Factor 5; 007 TWINE, Rogue Squadron, Indiana Jones, ...): порт rsp_hle/musyx.c
+    + трасса голосов в том же формате A/R/E, что и у ABI1/2/3."""
+    MX_SUB = 192
+    MX_VOICES = 32
+    MX_VSIZE = 0x50
+
+    # ---- чтение DRAM ----
+    def mx_u8(self, a):
+        return self.m.dram_read_bytes(a & 0xFFFFFF, 1)[0]
+
+    def mx_u16s(self, a, n):
+        if n <= 0:
+            return []
+        return list(struct.unpack('>%dH' % n, self.m.dram_read_bytes(a & 0xFFFFFF, 2 * n)))
+
+    def mx_s16s(self, a, n):
+        if n <= 0:
+            return []
+        return list(struct.unpack('>%dh' % n, self.m.dram_read_bytes(a & 0xFFFFFF, 2 * n)))
+
+    def mx_u32s(self, a, n):
+        if n <= 0:
+            return []
+        return list(struct.unpack('>%dI' % n, self.m.dram_read_bytes(a & 0xFFFFFF, 4 * n)))
+
+    def mx_store_u16(self, a, vals):
+        self.m.dram_write_bytes(a & 0xFFFFFF, struct.pack('>%dH' % len(vals), *[v & 0xFFFF for v in vals]))
+
+    # ---- состояние ----
+    def mx_load_base_vol(self, address):
+        hi = self.mx_u16s(address, 4)
+        lo = self.mx_u16s(address + 8, 4)
+        return [_to_i32((hi[k] << 16) | lo[k]) for k in range(4)]
+
+    def mx_save_base_vol(self, bv, address):
+        self.mx_store_u16(address, [(v >> 16) & 0xFFFF for v in bv] + [v & 0xFFFF for v in bv])
+
+    def mx_update_base_vol(self, bv, voice_mask, last_sample_ptr, mask_15, ptr_24):
+        if voice_mask:
+            for i in range(self.MX_VOICES):
+                if (voice_mask >> i) & 1:
+                    vals = self.mx_s16s(last_sample_ptr + 8 * i, 4)
+                    for k in range(4):
+                        bv[k] = _to_i32(bv[k] + vals[k])
+        if mask_15:
+            for i in range(4):
+                if (mask_15 >> i) & 1:
+                    vals = self.mx_s16s(ptr_24 + 8 * i, 4)
+                    for k in range(4):
+                        bv[k] = _to_i32(bv[k] + vals[k])
+        for k in range(4):
+            bv[k] = _to_i32(bv[k] * 0x0000F850) >> 16
+
+    # ---- голоса ----
+    def mx_cat(self, catsrc, nbytes_unit):
+        ptr1, ptr2, size1, size2 = struct.unpack('>IIHH', self.m.dram_read_bytes(catsrc & 0xFFFFFF, 12))
+        data = self.m.dram_read_bytes(ptr1 & 0xFFFFFF, size1)
+        if size2:
+            data += self.m.dram_read_bytes(ptr2 & 0xFFFFFF, size2)
+        return data, size1
+
+    def mx_adpcm_decode(self, dst, doff, src, table, count, skip):
+        """adpcm_decode_frames: dst - список int, doff - смещение, src - bytes."""
+        sp = 0
+        nb = 8
+        jump_gap = False
+        if skip >= 32:
+            jump_gap = True
+            nb += 16
+            sp += 4
+        n = len(src)
+        for _ in range(count):
+            if nb >= n:
+                break
+            c2 = src[nb]
+            book = table[(c2 & 0xF0):(c2 & 0xF0) + 16]
+            if len(book) < 16:
+                book = book + [0] * (16 - len(book))
+            rshift = c2 & 0x0F
+            frame = [0] * 32
+            frame[0] = _s16((src[sp] << 8) | src[sp + 1]) if sp + 3 < n else 0
+            frame[1] = _s16((src[sp + 2] << 8) | src[sp + 3]) if sp + 3 < n else 0
+            for i in range(1, 16):
+                byte = src[nb + i] if nb + i < n else 0
+                frame[2 * i] = _s16((byte & 0xF0) << 8) >> rshift
+                frame[2 * i + 1] = _s16((byte & 0x0F) << 12) >> rshift
+            out = [0] * 32
+            out[0], out[1] = frame[0], frame[1]
+            b1, b2 = book[0:8], book[8:16]
+
+            def resid(d0, cnt, last0):
+                l1, l2 = out[last0], out[last0 + 1]
+                for i in range(cnt):
+                    accu = (frame[d0 + i] << 11) + b1[i] * l1 + b2[i] * l2
+                    for j in range(i):
+                        accu += b2[j] * frame[d0 + i - 1 - j]
+                    out[d0 + i] = _clamp16(accu >> 11)
+            resid(2, 6, 0)
+            resid(8, 8, 6)
+            resid(16, 8, 14)
+            resid(24, 8, 22)
+            if jump_gap:
+                nb += 8
+                sp += 32
+            jump_gap = not jump_gap
+            nb += 16
+            sp += 4
+            dst[doff:doff + 32] = out
+            doff += 32
+
+    def mx_load_samples(self, vp):
+        samples = [0] * (0x200 + 16)
+        ad3c = self.mx_u8(vp + 0x3C)
+        if ad3c == 0:                                          # PCM16
+            u8_3e = self.mx_u8(vp + 0x3E)
+            u16_40, u16_42 = self.mx_u16s(vp + 0x40, 2)
+            count = _align(u16_40 + u8_3e, 4)
+            segbase = 0x200 - count
+            offset = u8_3e
+            data, size1 = self.mx_cat(vp + 0x24, 2)
+            vals = list(struct.unpack('>%dh' % (len(data) // 2), data[:len(data) & ~1]))
+            samples[segbase:segbase + len(vals)] = vals[:max(0, 0x200 - segbase)]
+            if u16_42:
+                data, size1 = self.mx_cat(vp + 0x30, 2)
+                vals = list(struct.unpack('>%dh' % (len(data) // 2), data[:len(data) & ~1]))
+                samples[0:len(vals)] = vals[:0x200]
+        else:
+            u8_3d = self.mx_u8(vp + 0x3D)
+            u8_3e = self.mx_u8(vp + 0x3E)
+            u8_3f = self.mx_u8(vp + 0x3F)
+            tptr = struct.unpack('>I', self.m.dram_read_bytes((vp + 0x40) & 0xFFFFFF, 4))[0]
+            table = self.mx_s16s(tptr, 128)
+            count = ad3c << 5
+            segbase = 0x200 - count
+            offset = u8_3e & 0x1F
+            data, _ = self.mx_cat(vp + 0x24, 1)
+            self.mx_adpcm_decode(samples, segbase, data, table, ad3c, u8_3e)
+            if u8_3d:
+                data, _ = self.mx_cat(vp + 0x30, 1)
+                self.mx_adpcm_decode(samples, 0, data, table, u8_3d, u8_3f)
+        return samples, segbase, offset
+
+    def mx_mix_voice(self, mixer, vp, samples, segbase, offset, last_sample_ptr):
+        S = self.MX_SUB
+        pitch_q16, pitch_shift = self.mx_u16s(vp + 0x20, 2)
+        end_point, restart_point = self.mx_u16s(vp + 0x48, 2)
+        u16_4e = self.mx_u16s(vp + 0x4E, 1)[0]
+        start = segbase + offset + u16_4e
+        s_end = segbase + end_point
+        s_restart = (restart_point & 0x7FFF) + (0 if (restart_point & 0x8000) else segbase)
+        step = pitch_shift << 4
+        env = [_to_i32(x) for x in self.mx_u32s(vp, 4)]
+        env_step = [_to_i32(x) for x in self.mx_u32s(vp + 0x10, 4)]
+        i = np.arange(S, dtype=np.int64)
+        tot = pitch_q16 + step * i
+        lut_i = (tot & 0xFC00) >> 8
+        smp = start + (tot >> 16)
+        i0 = 0
+        while i0 < S:
+            hit = np.nonzero(smp[i0:] >= s_end)[0]
+            if len(hit) == 0:
+                break
+            j = i0 + int(hit[0])
+            smp[j:] += s_restart - s_end
+            i0 = j + 1
+        arr = np.array(samples, dtype=np.int64)
+        L = np.array(RESAMPLE_LUT, dtype=np.int64)
+        L = np.where(L >= 0x8000, L - 0x10000, L)
+        idx = np.clip(smp, 0, len(samples) - 4)
+        accu = np.zeros(S, dtype=np.int64)
+        for k in range(4):
+            accu = np.clip(accu + ((arr[idx + k] * L[lut_i + k]) >> 15), -32768, 32767)
+        v = accu
+        v4 = []
+        for k in range(4):
+            e = ((env[k] + env_step[k] * i + 0x80000000) & 0xFFFFFFFF) - 0x80000000
+            a = (v * (e >> 16)) >> 15
+            a = np.clip(a, -32768, 32767)
+            dst = mixer[k]
+            mixer[k] = np.clip(a + dst, -32768, 32767)
+            v4.append(int(a[-1]))
+        self.mx_store_u16(last_sample_ptr, v4)
+        self.mx_trace_voice(vp, last_sample_ptr, samples, smp, start, pitch_shift, env, env_step, S)
+
+    def mx_trace_voice(self, vp, key, samples, smp, start, pitch_shift, env, env_step, S):
+        if self.t is None:
+            return
+        ptr1, ptr2, z1, z2 = struct.unpack('>IIHH', self.m.dram_read_bytes((vp + 0x24) & 0xFFFFFF, 12))
+        tv = self.voice(key)
+        if z1 == 0 and z2 == 0:
+            tv[0] = tv[1] = tv[2] = 0
+            self.mx_prev.pop(key, None)
+            return
+        prev = self.mx_prev.get(key)
+        init = prev is None
+        if not init:
+            pp1, pp2, pz1, pz2 = prev
+            lo = pp2 if pz2 else pp1
+            hi = lo + (pz2 if pz2 else pz1) + 0x80
+            lo2 = pp1
+            if not ((lo <= ptr1 < hi) or (lo2 <= ptr1 < lo2 + pz1 + 0x80)):
+                init = True
+        if init:
+            tv[0] = 0
+        # поток потреблённых выборок (как в C-трассе)
+        run = [samples[start]] if 0 <= start < 0x200 else []
+        prv = start
+        sm = [int(x) for x in smp]
+        for idx in sm:
+            if 0 <= idx < 0x200 and run is not None:
+                if idx > prv:
+                    run.extend(samples[prv + 1:idx + 1])
+                elif idx < prv:
+                    run.append(samples[idx])
+                prv = idx
+            if len(run) >= 4096:
+                break
+        run = run[:4096]
+        if run:
+            cnt = len(run) * 2
+            off = -1
+            if init or tv[1] == 0:
+                h = (2166136261 ^ 0x4D555358) & M32
+                h = (h * 16777619) & M32
+                for k in range(min(16, len(run))):
+                    h ^= run[k] & 0xFFFF
+                    h = (h * 16777619) & M32
+                tv[1] = h
+            h = tv[1]
+            if tv[0] + cnt > self.cov_len(h) and self.cov_len(h) < 262144:
+                off = len(self.pcm)
+                self.pcm += np.array(run, dtype='<i2').tobytes()
+                self.cov[h] = tv[0] + cnt
+            self.t.append('A %u %u %u %u %x %x %x %d %d %u\n' % (1 if init else 0, 0, 0, cnt, key, ptr2, h, tv[0], off, 1))
+            tv[0] += cnt
+        self.t.append('R %u %u %x %u %u %u\n' % (0, pitch_shift * 8, key, 0, 0, S))
+        self.t.append('E %u %u %u %u %d %d %d %d %d %d %d %d %x\n' % (
+            0, 0, 0, S, env[0] >> 16, env[1] >> 16,
+            _to_i32(env[0] + env_step[0] * S) >> 16, _to_i32(env[1] + env_step[1] * S) >> 16, 0, 0, 32768, 0, key))
+        self.mx_prev[key] = (ptr1, ptr2, z1, z2)
+
+    def mx_voice_stage(self, mixer, vp, last_sample_ptr):
+        sz1 = self.mx_u16s(vp + 0x24 + 8, 1)[0]
+        if sz1 == 0:
+            return struct.unpack('>I', self.m.dram_read_bytes((vp + 0x44) & 0xFFFFFF, 4))[0]
+        i = 0
+        while True:
+            samples, segbase, offset = self.mx_load_samples(vp)
+            if not ((self.mute_mask >> i) & 1 if i < 32 else 0):
+                self.mx_mix_voice(mixer, vp, samples, segbase, offset, last_sample_ptr + i * 8)
+            out = struct.unpack('>I', self.m.dram_read_bytes((vp + 0x44) & 0xFFFFFF, 4))[0]
+            if out != 0 or i > 64:
+                return out
+            i += 1
+            vp += self.MX_VSIZE
+
+    # ---- SFX ----
+    def mx_sfx_stage(self, mixer, state, sfx_ptr, idx, v2):
+        S = self.MX_SUB
+        if sfx_ptr == 0:
+            return
+        cbuf_ptr, cbuf_len = struct.unpack('>II', self.m.dram_read_bytes(sfx_ptr & 0xFFFFFF, 8))
+        tap_count = self.mx_u16s(sfx_ptr + 8, 1)[0]
+        tap_delays = self.mx_u32s(sfx_ptr + 0x0C, 8)
+        tap_gains = self.mx_s16s(sfx_ptr + 0x2C, 8)
+        hgain = self.mx_s16s(sfx_ptr + 0x0A, 1)[0]
+        hco = self.mx_s16s(sfx_ptr + 0x40, 4)
+        g0, g1 = self.mx_u16s(sfx_ptr + 0x3C, 2)
+        pos = idx * S
+        sub = np.zeros(S, dtype=np.int64)
+        for i in range(min(tap_count, 8)):
+            dpos = pos - tap_delays[i]
+            if dpos <= 0:
+                dpos += cbuf_len
+            dlen = S
+            delayed = [0] * S
+            if dpos + S > cbuf_len:
+                dlen = cbuf_len - dpos
+                if dlen < 0:
+                    dlen = 0
+                delayed[dlen:] = self.mx_s16s(cbuf_ptr, S - dlen)
+            delayed[:dlen] = self.mx_s16s(cbuf_ptr + dpos * 2, dlen)
+            sub = np.clip(sub + ((np.array(delayed, dtype=np.int64) * tap_gains[i] + 0x4000) >> 15), -32768, 32767)
+        L, R, C = mixer[0], mixer[1], mixer[2]
+        if not v2:
+            mixer[0] = np.clip(L + sub, -32768, 32767)
+            mixer[1] = np.clip(R + sub, -32768, 32767)
+        else:
+            v1 = (sub * g0) >> 16
+            v2_ = (sub * g1) >> 16
+            mixer[0] = np.clip(L + v1, -32768, 32767)
+            mixer[1] = np.clip(R + v1, -32768, 32767)
+            mixer[2] = np.clip(C + v2_, -32768, 32767)
+        buf = np.concatenate([np.array(state['last4'], dtype=np.int64), sub])        # buffer[0..3] = last4, subframe
+        state['last4'] = [int(x) for x in sub[S - 4:]]
+        x = buf[1:]                                                                    # buffer + 1
+        h = [(hgain * hco[k]) >> 15 for k in range(4)]
+        acc = (h[0] * x[0:S] + h[1] * x[1:S + 1] + h[2] * x[2:S + 2] + h[3] * x[3:S + 3]) >> 15
+        mixer[3] = np.clip(mixer[3] + acc, -32768, 32767)
+        self.mx_store_u16(cbuf_ptr + pos * 2, [int(v) for v in mixer[3]])
+
+    def mx_write_lr(self, mixer, bl, br, output_ptr):
+        S = self.MX_SUB
+        l = np.clip(mixer[0] + bl, -32768, 32767) & 0xFFFF
+        r = np.clip(mixer[1] + br, -32768, 32767) & 0xFFFF
+        out = np.empty(S * 2, dtype='>u2')
+        out[0::2] = l
+        out[1::2] = r
+        self.m.dram_write_bytes(output_ptr & 0xFFFFFF, out.tobytes())
+
+    def mx_init_v1(self, bv):
+        S = self.MX_SUB
+        base_cc0 = _clamp16(bv[2])
+        base_e50 = _clamp16(bv[3])
+        cc0 = self.mx_cc0
+        left = np.clip(cc0 + base_cc0, -32768, 32767)
+        right = np.clip(-cc0 - base_cc0, -32768, 32767)
+        mixer = [left, right, np.zeros(S, dtype=np.int64), np.full(S, base_e50, dtype=np.int64)]
+        return mixer
+
+    def mx_task_v1(self):
+        S = self.MX_SUB
+        sp = self.m.spmem
+        sfd_ptr = sp[0xFF0 >> 2]
+        sfd_count = sp[0xFF4 >> 2]
+        state_ptr = struct.unpack('>I', self.m.dram_read_bytes((sfd_ptr + 8) & 0xFFFFFF, 4))[0]
+        bv = self.mx_load_base_vol(state_ptr + 0x100)
+        self.mx_cc0 = np.array(self.mx_s16s(state_ptr + 0x110, S), dtype=np.int64)
+        state = {'last4': self.mx_s16s(state_ptr + 0x290, 4)}
+        while True:
+            sfx_index = self.mx_u16s(sfd_ptr + 2, 1)[0]
+            voice_mask = struct.unpack('>I', self.m.dram_read_bytes((sfd_ptr + 4) & 0xFFFFFF, 4))[0]
+            sfx_ptr = struct.unpack('>I', self.m.dram_read_bytes((sfd_ptr + 0xC) & 0xFFFFFF, 4))[0]
+            vp = sfd_ptr + 0x10
+            self.mx_update_base_vol(bv, voice_mask, state_ptr, 0, 0)
+            mixer = self.mx_init_v1(bv)
+            output_ptr = self.mx_voice_stage(mixer, vp, state_ptr)
+            self.mx_sfx_stage(mixer, state, sfx_ptr, sfx_index, False)
+            self.mx_write_lr(mixer, _clamp16(bv[0]), _clamp16(bv[1]), output_ptr)
+            self.mx_cc0 = mixer[2]
+            self.tr('S 0 %u 0\n' % (S * 4))
+            sfd_count -= 1
+            if sfd_count == 0:
+                break
+            sfd_ptr += 0x10 + self.MX_VOICES * self.MX_VSIZE
+            state_ptr = struct.unpack('>I', self.m.dram_read_bytes((sfd_ptr + 8) & 0xFFFFFF, 4))[0]
+        self.mx_save_base_vol(bv, state_ptr + 0x100)
+        self.mx_store_u16(state_ptr + 0x110, [int(v) for v in self.mx_cc0])
+        self.mx_store_u16(state_ptr + 0x290, state['last4'])
+        self.m.rsp_break(0x200)
+
+    def mx_task_v2(self):
+        S = self.MX_SUB
+        sp = self.m.spmem
+        sfd_ptr = sp[0xFF0 >> 2]
+        sfd_count = sp[0xFF4 >> 2]
+        while True:
+            sfx_index = self.mx_u16s(sfd_ptr + 2, 1)[0]
+            voice_mask = struct.unpack('>I', self.m.dram_read_bytes((sfd_ptr + 4) & 0xFFFFFF, 4))[0]
+            state_ptr = struct.unpack('>I', self.m.dram_read_bytes((sfd_ptr + 8) & 0xFFFFFF, 4))[0]
+            sfx_ptr = struct.unpack('>I', self.m.dram_read_bytes((sfd_ptr + 0xC) & 0xFFFFFF, 4))[0]
+            vp = sfd_ptr + 0x28
+            ptr_10 = struct.unpack('>I', self.m.dram_read_bytes((sfd_ptr + 0x10) & 0xFFFFFF, 4))[0]
+            mask_15 = self.mx_u8(sfd_ptr + 0x15)
+            mask_16 = self.mx_u16s(sfd_ptr + 0x16, 1)[0]
+            ptr_18, ptr_1c, ptr_20, ptr_24 = self.mx_u32s(sfd_ptr + 0x18, 4)[0], self.mx_u32s(sfd_ptr + 0x1C, 1)[0], \
+                self.mx_u32s(sfd_ptr + 0x20, 1)[0], self.mx_u32s(sfd_ptr + 0x24, 1)[0]
+            bv = self.mx_load_base_vol(state_ptr + 0x100)
+            state = {'last4': self.mx_s16s(state_ptr + 0x110, 4)}
+            self.mx_update_base_vol(bv, voice_mask, state_ptr, mask_15, ptr_24)
+            mixer = [np.full(S, _clamp16(bv[k]), dtype=np.int64) for k in range(4)]
+            output_ptr = self.mx_voice_stage(mixer, vp, state_ptr)
+            self.mx_sfx_stage(mixer, state, sfx_ptr, sfx_index, True)
+            for k in range(3):
+                self.m.dram_write_bytes((output_ptr + k * 2 * S) & 0xFFFFFF,
+                                        np.array(mixer[k], dtype='>i2').tobytes())
+            self.mx_save_base_vol(bv, state_ptr + 0x100)
+            self.mx_store_u16(state_ptr + 0x110, state['last4'])
+            if mask_16:
+                self.mx_interleave_v2(mask_16, ptr_18, ptr_1c, ptr_20)
+            self.tr('S 0 %u 0\n' % (S * 4))
+            sfd_count -= 1
+            if sfd_count == 0:
+                break
+            sfd_ptr += 0x28 + self.MX_VOICES * self.MX_VSIZE
+        self.m.rsp_break(0x200)
+
+    def mx_interleave_v2(self, mask_16, ptr_18, ptr_1c, output_ptr):
+        S = self.MX_SUB
+        sub = np.zeros(S, dtype=np.int64)
+        v = np.array(self.mx_s16s(ptr_1c, S), dtype=np.int64)
+        left = v.copy()
+        right = np.clip(-v, -32768, 32767)
+        for k in range(8):
+            if not (mask_16 >> k) & 1:
+                continue
+            address = struct.unpack('>I', self.m.dram_read_bytes((ptr_18 + 8 * k) & 0xFFFFFF, 4))[0]
+            hgain = self.mx_s16s(ptr_18 + 8 * k + 4, 1)[0]
+            a = np.array(self.mx_s16s(address, S), dtype=np.int64)
+            b = np.array(self.mx_s16s(address + 2 * S, S), dtype=np.int64)
+            c = np.array(self.mx_s16s(address + 4 * S, S), dtype=np.int64)
+            left = np.clip(left + ((a * hgain + 0x4000) >> 15), -32768, 32767)
+            right = np.clip(right + ((b * hgain + 0x4000) >> 15), -32768, 32767)
+            sub = np.clip(sub + ((c * hgain + 0x4000) >> 15), -32768, 32767)
+        out = np.empty(S * 2, dtype='>u2')
+        out[0::2] = left & 0xFFFF
+        out[1::2] = right & 0xFFFF
+        self.m.dram_write_bytes(output_ptr & 0xFFFFFF, out.tobytes())
+        self.mx_store_u16(ptr_1c, [int(x) for x in sub])
+
+
+class Hle(AlistExtra, MusyxMixin):
     DMEM_BASE = 0x5C0
 
     def __init__(self, m):
@@ -2811,7 +3963,7 @@ class Hle:
         self.target = [0, 0]
         self.rate = [0, 0]
         self.loop = 0
-        self.table = [0] * 128
+        self.table = [0] * 384      # 128 + нули: как в C чтение книги за концом таблицы
         self.cached = {}
         self.ucode_printed = False
         # трассировка
@@ -2825,6 +3977,13 @@ class Hle:
         self.last_load_in = 0
         self.last_load_cnt = 0
         self.unsupported = False
+        self.env_values = [0, 0, 0]
+        self.env_steps = [0, 0, 0]
+        self.filter_count = 0
+        self.filter_lut = [0, 0]
+        self.mute_mask = 0
+        self.mx_prev = {}
+        self.mx_cc0 = None
 
     # ── доступ к DRAM как к логическому BE ──
     def dram_u16(self, a):
@@ -2902,6 +4061,25 @@ class Hle:
                     return lambda: self.process_audio(False)
                 if v == 0x1DC8138C or v == 0x1E3C1390:
                     return lambda: self.process_audio(True)       # GE/BC: ENVMIXER_GE не реализован - как ABI1
+            else:
+                v = d(ud + 0x10)
+                nead = {0x11181350: 'mk', 0x111812E0: 'sfj', 0x110412AC: 'wrjb', 0x110412CC: 'sf',
+                        0x1CD01250: 'fz', 0x1F08122C: 'ys', 0x1F38122C: '1080', 0x1F681230: 'oot',
+                        0x1F801250: 'mm', 0x109411F8: 'mmb', 0x1EAC11B8: 'ac', 0x1F4C1230: 'fz'}
+                if v == 0x00010010:
+                    return self.mx_task_v2           # MusyX v2 (Indiana Jones, Battle for Naboo)
+                if v in nead:
+                    tbl = self.n2_table(nead[v])
+                    return lambda: self.run_alist(tbl)
+        else:
+            v = d(ud + 0x10)
+            if v == 0x00000001:
+                return self.mx_task_v1               # MusyX v1 (Rogue Squadron, 007 TWINE, ...)
+            naudio = {0x0000127C: 'naudio', 0x00001280: 'bk', 0x1C58126C: 'dk',
+                      0x1AE8143C: 'mp3', 0x1AB0140C: 'cbfd'}
+            if v in naudio:
+                tbl = self.n3_table(naudio[v])
+                return lambda: self.run_alist(tbl)
         self.unsupported = True
         return self.unknown_task
 
@@ -3186,7 +4364,7 @@ class Hle:
                 flags, self.inn, self.out, cnt, address, self.loop, h, cum, off, 1 if (cum + cnt) < 0x7FFFFFFF else 0))
             v[0] += cnt
 
-    def adpcm(self, init, loop, dmemo, dmemi, count, last_frame_address):
+    def adpcm(self, init, loop, dmemo, dmemi, count, last_frame_address, two_bit=False):
         tbl = self.table
         if init:
             last = [0] * 16
@@ -3206,15 +4384,23 @@ class Hle:
             di += 1
             scale = (code & 0xF0) >> 4
             cb = (code & 0xF) << 4
-            rshift = 12 - scale if scale < 12 else 0
             frame = [0] * 16
-            for i in range(8):
-                byte = buf[(di + i) & 0xFFF]
-                hi = _s16((byte & 0xF0) << 8) >> rshift
-                lo = _s16((byte & 0x0F) << 12) >> rshift
-                frame[2 * i] = hi
-                frame[2 * i + 1] = lo
-            di += 8
+            if two_bit:
+                rshift = 14 - scale if scale < 14 else 0
+                for i in range(4):
+                    byte = buf[(di + i) & 0xFFF]
+                    frame[4 * i] = _s16((byte & 0xC0) << 8) >> rshift
+                    frame[4 * i + 1] = _s16((byte & 0x30) << 10) >> rshift
+                    frame[4 * i + 2] = _s16((byte & 0x0C) << 12) >> rshift
+                    frame[4 * i + 3] = _s16((byte & 0x03) << 14) >> rshift
+                di += 4
+            else:
+                rshift = 12 - scale if scale < 12 else 0
+                for i in range(8):
+                    byte = buf[(di + i) & 0xFFF]
+                    frame[2 * i] = _s16((byte & 0xF0) << 8) >> rshift
+                    frame[2 * i + 1] = _s16((byte & 0x0F) << 12) >> rshift
+                di += 8
             book1 = tbl[cb:cb + 8]
             book2 = tbl[cb + 8:cb + 16]
             l1 = last[14]
@@ -3329,47 +4515,9 @@ class Hle:
         s[idx] = np.clip(cur + ((src * gain) >> 15), -32768, 32767)
 
     def c_polef(self, w1, w2):
-        flags = (w1 >> 16) & 0xFF
-        gain = w1 & 0xFFFF
-        address = self.get_address(w2)
         if self.count == 0:
             return
-        count = _align(_align(self.count, 16), 16)
-        s = self.s
-        h1 = self.table[0:8]
-        h2 = self.table[8:16]
-        if flags & A_INIT:
-            l1 = l2 = 0
-        else:
-            l1 = _s16(self.dram_u16(address + 4))
-            l2 = _s16(self.dram_u16(address + 6))
-        h2_before = list(h2)
-        h2n = [(h2[i] * gain) >> 14 for i in range(8)]
-        for i in range(8):
-            self.table[8 + i] = _s16(h2n[i])
-        h2 = self.table[8:16]
-        dmemi = self.inn >> 1
-        dst = self.out >> 1
-        last = None
-        while count != 0:
-            frame = [int(s[(dmemi + i) & 0x7FF]) for i in range(8)]
-            dmemi += 8
-            outs = [0] * 8
-            for i in range(8):
-                accu = frame[i] * gain
-                accu += h1[i] * l1 + h2_before[i] * l2
-                for j in range(i):
-                    accu += h2[j] * frame[i - 1 - j]
-                outs[i] = _clamp16(accu >> 14)
-            for i in range(8):
-                s[(dst + i) & 0x7FF] = outs[i]
-            l1 = outs[6]
-            l2 = outs[7]
-            last = outs
-            dst += 8
-            count -= 16
-        for i in range(4):
-            self.dram_set_u16(address + 2 * i, last[4 + i])
+        self.a_polef((w1 >> 16) & A_INIT, self.out, self.inn, self.count, w1 & 0xFFFF, self.get_address(w2))
 
 
 def _to_i32(x):
@@ -3517,7 +4665,7 @@ def trace(path, prefix, seconds, raw_path=None, progress=None):
         y = resample_audio(a, rate, 44100)
         np.clip(np.round(y), -32768, 32767).astype('<i2').tofile(raw_path)
     if m.hle.unsupported:
-        print("usf_pyemu: аудио-микрокод этой игры не поддерживается (нужен ABI1)", file=sys.stderr)
+        print("usf_pyemu: аудио-микрокод этой игры не поддерживается (поддержаны ABI1, ABI2, ABI3)", file=sys.stderr)
 
 
 if __name__ == '__main__':

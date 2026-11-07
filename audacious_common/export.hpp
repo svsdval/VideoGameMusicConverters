@@ -170,9 +170,13 @@ inline void export_selected(const Info & inf)
             if (use_builtin)
             {
                 std::string err = inf.builtin(j, want_xm, want_midi);
-                if (err.empty()) ok++;
-                else errors += j.input + ": " + err + "\n";
-                continue;
+                if (err.empty()) { ok++; continue; }
+                // "unsupported: ..." - встроенный конвертер не умеет этот файл, но скрипт может (USF ABI2/ABI3)
+                if (err.rfind("unsupported:", 0) != 0 || access(script.c_str(), R_OK))
+                {
+                    errors += j.input + ": " + err + "\n";
+                    continue;
+                }
             }
             std::vector<std::string> a = {python, script, j.input};
             if (inf.style_b)

@@ -77,7 +77,7 @@ python3 usf2xm-midi-wav.py --build-tracer                      # (optional) buil
 ```
 Other options: `--seconds` (default: `length`+`fade` tags, else 120), `--channels` (32), `--release-threshold` (0.04), `--bend-threshold` (0.75 semitones, bigger changes become `3FF` glides), `--no-pan`, `--keep-trace`.
 
-Limitations: only the libultra audio ABI1 and MusyX v1/v2 microcodes (007: The World Is Not Enough, Rogue Squadron, Indiana Jones, ...); ABI2/ABI3 games give a warning and no notes; the Python emulator knows only ABI1, MusyX needs the native tracer (rebuild it with `--build-tracer` after updating); envelopes are
+Limitations: audio microcodes libultra ABI1, ABI2 ("nead": Zelda, Mario Kart, Star Fox, ...), ABI3 ("naudio": Banjo, DK64, Perfect Dark, Conker, ...) and MusyX v1/v2 (007 TWINE, Rogue Squadron, Indiana Jones, ...). The native tracer handles ABI1 and MusyX; ABI2/ABI3 are handled by the built-in Python emulator (`usf2xm-midi-wav.py` switches to it automatically when the native tracer finds no voices; the Python ports were checked against the lazyusf2 C code on random alist programs, but there was no real ABI2/ABI3 game to test the whole chain). MusyX in the Python emulator matches the native tracer bit-for-bit on 900 real 007 tasks, but the Python R4300 core does not get 007 past the first audio frames yet, so for MusyX games use the native tracer. The ABI2/ABI3 ports can be re-checked against the C code with `usf_tracer/abitest/run.sh`. MP3 commands (ABI3) and the ENVMIXER of GoldenEye/Blast Corps are not emulated (rebuild the native tracer with `--build-tracer` after updating); envelopes are
 approximated with volume-column steps; sample reverb (aux bus) is not reproduced in XM/MIDI (it is in the WAV).
 
 ## NSF (NES) -> XM / MIDI / WAV
@@ -251,7 +251,7 @@ python3 usf2xm-midi-wav.py --build-tracer                      # (опциона
 ```
 Прочие опции: `--seconds` (по умолчанию теги `length`+`fade`, иначе 120), `--channels` (32), `--release-threshold` (0.04), `--bend-threshold` (0.75 полутона, большие изменения становятся глиссандо `3FF`), `--no-pan`, `--keep-trace`.
 
-Ограничения: аудио-микрокоды libultra ABI1 и MusyX v1/v2 (007: The World Is Not Enough, Rogue Squadron, Indiana Jones и др.); игры с ABI2/ABI3 дают предупреждение и ноты не получаются; Python-эмулятор знает только ABI1, для MusyX нужен нативный трассировщик (пересоберите: `--build-tracer`);
+Ограничения: аудио-микрокоды libultra ABI1, ABI2 («nead»: Zelda, Mario Kart, Star Fox и др.), ABI3 («naudio»: Banjo, DK64, Perfect Dark, Conker и др.) и MusyX v1/v2 (007 TWINE, Rogue Squadron, Indiana Jones и др.). Нативный трассировщик знает ABI1 и MusyX, ABI2/ABI3 - встроенный Python-эмулятор (`usf2xm-midi-wav.py` переключается на него сам, если нативный не нашёл голосов; порты сверены с C-кодом lazyusf2 на случайных alist-программах, но реальной игры с ABI2/ABI3 для проверки всей цепочки не было). MusyX в Python-эмуляторе совпадает с нативным трассировщиком бит-в-бит на 900 реальных задачах 007, но ядро R4300 на Python пока не доводит 007 дальше первых аудио-кадров, поэтому для игр с MusyX нужен нативный трассировщик. Порты ABI2/ABI3 можно перепроверить по C-коду: `usf_tracer/abitest/run.sh`. MP3-команды (ABI3) и ENVMIXER GoldenEye/Blast Corps не эмулируются (после обновления пересоберите нативный трассировщик: `--build-tracer`);
 огибающие аппроксимируются ступенями volume-колонки; реверберация сэмплов (aux-шина) не переносится в XM/MIDI (есть в WAV).
 
 ## NSF (NES) -> XM / MIDI / WAV

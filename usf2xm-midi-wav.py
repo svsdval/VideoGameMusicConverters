@@ -14,9 +14,10 @@ USF / miniusf (Nintendo 64) -> XM / MIDI / WAV
      высота = pitch ресемплера, громкость/панорама = ENVMIXER), сам вырезает
      сэмплы (с поиском точки лупа и определением тона) и пишет XM / MIDI / WAV.
 
-Поддерживается стандартный libultra ABI1 (большинство игр) и MusyX v1/v2 (Factor 5:
-007 TWINE, Rogue Squadron, Indiana Jones, Battle for Naboo и др.; только нативный
-трассировщик usf_tracer/usftrace). Игры с ABI2/ABI3 пока не поддерживаются.
+Поддерживаются аудио-микрокоды libultra ABI1 (большинство игр), ABI2 ("nead": Zelda, Mario Kart,
+Star Fox, F-Zero X, ...), ABI3 ("naudio": Banjo, Donkey Kong 64, Perfect Dark, Conker, ...) и
+MusyX v1/v2 (007 TWINE, Rogue Squadron, Indiana Jones, ...). ABI1 и MusyX умеет нативный
+трассировщик usf_tracer/usftrace, ABI2/ABI3 - встроенный Python-эмулятор (скрипт сам переключится).
 
 Использование:
     python3 usf2xm-midi-wav.py sparse00.miniusf
@@ -763,7 +764,7 @@ def convert(args):
             raise SystemExit("usftrace не собран (см. usf_tracer/build.sh)")
     if tracer is None:
         print("[usf] эмулятор: встроенный на Python (usf_pyemu.py, ~2.5x медленнее реального времени, "
-              "только аудио-микрокод ABI1); быстрее и шире - C++ lazyusf2: --build-tracer")
+              "ABI1/ABI2/ABI3/MusyX); быстрее - C++ lazyusf2: --build-tracer")
 
     work = tempfile.mkdtemp(prefix='usf2xm_')
     prefix = os.path.join(work, 'tr')
@@ -775,6 +776,12 @@ def convert(args):
                 shutil.copy(prefix + ext, base + '.usftrace' + ext)
 
         rate, ucode, voices, frame_times, frame_samples = parse_trace(prefix)
+        if not voices and tracer is not None and args.tracer == 'auto':
+            # нативный трассировщик знает ABI1 и MusyX; ABI2/ABI3 есть только в Python-эмуляторе
+            print(f"[usf] нативный трассировщик не нашёл голосов (микрокод {ucode}); "
+                  f"пробую встроенный Python-эмулятор (медленнее, поддерживает ABI1/ABI2/ABI3/MusyX)")
+            raw = run_tracer(None, in_path, prefix, seconds, want_wav)
+            rate, ucode, voices, frame_times, frame_samples = parse_trace(prefix)
         if want_wav and raw:
             wav_path = (args.wav_file or base + '.wav')
             with open(raw, 'rb') as f:
@@ -791,8 +798,8 @@ def convert(args):
         if not voices:
             raise SystemExit(
                 f"В логе нет голосов ADPCM/ENVMIXER. Микрокод игры: {ucode}. "
-                f"Поддерживаются ABI1 (libultra) и MusyX v1/v2 (нативный usf_tracer/usftrace; "
-                f"пересоберите его: --build-tracer).")
+                f"Поддерживаются ABI1, ABI2, ABI3 (libultra) и MusyX v1/v2 (Python-эмулятор: --tracer python; "
+                f"нативный usf_tracer/usftrace знает ABI1 и MusyX).")
         print(f"[usf] {rate} Гц, кадр {frame_samples} сэмплов "
               f"({1000.0 * frame_samples / rate:.2f} мс), записей голосов: {len(voices)}")
 
