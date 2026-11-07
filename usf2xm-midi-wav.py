@@ -14,8 +14,9 @@ USF / miniusf (Nintendo 64) -> XM / MIDI / WAV
      высота = pitch ресемплера, громкость/панорама = ENVMIXER), сам вырезает
      сэмплы (с поиском точки лупа и определением тона) и пишет XM / MIDI / WAV.
 
-Поддерживается стандартный libultra ABI1 (большинство игр). Игры с MusyX/ABI2/ABI3
-пока не поддерживаются (скрипт сообщит об этом).
+Поддерживается стандартный libultra ABI1 (большинство игр) и MusyX v1/v2 (Factor 5:
+007 TWINE, Rogue Squadron, Indiana Jones, Battle for Naboo и др.; только нативный
+трассировщик usf_tracer/usftrace). Игры с ABI2/ABI3 пока не поддерживаются.
 
 Использование:
     python3 usf2xm-midi-wav.py sparse00.miniusf
@@ -790,7 +791,8 @@ def convert(args):
         if not voices:
             raise SystemExit(
                 f"В логе нет голосов ADPCM/ENVMIXER. Микрокод игры: {ucode}. "
-                f"Поддерживается только стандартный ABI1 (libultra).")
+                f"Поддерживаются ABI1 (libultra) и MusyX v1/v2 (нативный usf_tracer/usftrace; "
+                f"пересоберите его: --build-tracer).")
         print(f"[usf] {rate} Гц, кадр {frame_samples} сэмплов "
               f"({1000.0 * frame_samples / rate:.2f} мс), записей голосов: {len(voices)}")
 

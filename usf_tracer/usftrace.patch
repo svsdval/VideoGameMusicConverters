@@ -225,6 +225,125 @@ index 4e65113..0e2a580 100644
  
      if (*dram_u32(hle, ucode_data) == 0x00000001) {
          if (*dram_u32(hle, ucode_data + 0x30) == 0xf0000f00) {
+diff --git a/rsp_hle/musyx.c b/rsp_hle/musyx.c
+index d5a630a..bdee40d 100644
+--- a/rsp_hle/musyx.c
++++ b/rsp_hle/musyx.c
+@@ -30,6 +30,8 @@
+ #include "hle_external.h"
+ #include "hle_internal.h"
+ #include "memory.h"
++#include <stdio.h>
++#include "trace.h"
+ 
+ /* various constants */
+ enum { SUBFRAME_SIZE = 192 };
+@@ -242,6 +244,7 @@ void musyx_v1_task(struct hle_t* hle)
+ 
+         /* emit interleaved L,R subframes */
+         interleave_stage_v1(hle, &musyx, output_ptr);
++        if (usf_trace_f) fprintf(usf_trace_f, "S 0 %u 0\n", SUBFRAME_SIZE * 4u);
+ 
+         --sfd_count;
+         if (sfd_count == 0)
+@@ -328,6 +331,7 @@ void musyx_v2_task(struct hle_t* hle)
+ 
+         if (mask_16)
+             interleave_stage_v2(hle, &musyx, mask_16, ptr_18, ptr_1c, ptr_20);
++        if (usf_trace_f) fprintf(usf_trace_f, "S 0 %u 0\n", SUBFRAME_SIZE * 4u);
+ 
+         --sfd_count;
+         if (sfd_count == 0)
+@@ -719,6 +723,16 @@ static void mix_voice_samples(struct hle_t* hle, musyx_t *musyx,
+                       v4_env[0],      v4_env[1],      v4_env[2],      v4_env[3],
+                       v4_env_step[0], v4_env_step[1], v4_env_step[2], v4_env_step[3]);
+ 
++    int16_t tr_run[4096];
++    int tr_n = 0;
++    long tr_prev = -1;
++    int32_t tr_env0[4];
++    if (usf_trace_f) {
++        long st = sample - samples;
++        memcpy(tr_env0, v4_env, sizeof(tr_env0));
++        if (st >= 0 && st < SAMPLE_BUFFER_SIZE) { tr_run[tr_n++] = samples[st]; tr_prev = st; }
++    }
++
+     for (i = 0; i < SUBFRAME_SIZE; ++i) {
+         /* update sample and lut pointers and then pitch_accu */
+         const int16_t *lut = (RESAMPLE_LUT + ((pitch_accu & 0xfc00) >> 8));
+@@ -735,6 +749,15 @@ static void mix_voice_samples(struct hle_t* hle, musyx_t *musyx,
+             sample = sample_restart + dist;
+ 
+         /* apply resample filter */
++        if (usf_trace_f && tr_prev >= 0) {
++            long idx = sample - samples;
++            if (idx >= 0 && idx < SAMPLE_BUFFER_SIZE) {
++                long j;
++                if (idx > tr_prev) { for (j = tr_prev + 1; j <= idx && tr_n < 4096; j++) tr_run[tr_n++] = samples[j]; }
++                else if (idx < tr_prev && tr_n < 4096) tr_run[tr_n++] = samples[idx];
++                tr_prev = idx;
++            }
++        }
+         v = clamp_s16(dot4(sample, lut));
+ 
+         for (k = 0; k < 4; ++k) {
+@@ -749,6 +772,56 @@ static void mix_voice_samples(struct hle_t* hle, musyx_t *musyx,
+         }
+     }
+ 
++    if (usf_trace_f) {
++        /* трассировка: тот же формат, что у ABI1 (A/R/E), чтобы конвертеры работали без изменений */
++        uint32_t c0 = voice_ptr + VOICE_CATSRC_0;
++        uint32_t p1 = *dram_u32(hle, c0 + CATSRC_PTR1), p2 = *dram_u32(hle, c0 + CATSRC_PTR2);
++        uint16_t z1 = *dram_u16(hle, c0 + CATSRC_SIZE1), z2 = *dram_u16(hle, c0 + CATSRC_SIZE2);
++        struct usf_voice *tv = usf_voice_get(last_sample_ptr);
++        if (z1 == 0 && z2 == 0) {
++            tv->cum = 0; tv->has = 0; tv->addr = last_sample_ptr;
++            tv->hash = 0;
++            tv->used = 1;
++        } else {
++            /* новая нота: слот был пуст, либо источник данных не продолжает предыдущее окно */
++            int init = !tv->has;
++            if (!init) {
++                uint32_t lo = tv->prev_z2 ? tv->prev_p2 : tv->prev_p1;
++                uint32_t hi = lo + (tv->prev_z2 ? tv->prev_z2 : tv->prev_z1) + 0x80;
++                uint32_t lo2 = tv->prev_p1;
++                if (!((p1 >= lo && p1 < hi) || (p1 >= lo2 && p1 < lo2 + tv->prev_z1 + 0x80))) init = 1;
++            }
++            if (init) tv->cum = 0;
++            if (tr_n > 0) {
++                unsigned h, cnt = (unsigned)tr_n * 2, k;
++                long off = -1;
++                struct usf_cov *cv;
++                if (init || tv->hash == 0) {
++                    h = 2166136261u ^ 0x4d555358u; h *= 16777619u;
++                    for (k = 0; k < 16 && k < (unsigned)tr_n; k++) { h ^= (uint16_t)tr_run[k]; h *= 16777619u; }
++                    tv->hash = h;
++                }
++                h = tv->hash;
++                cv = usf_cov_get(h);
++                if (tv->cum + (long)cnt > cv->len && cv->len < 262144) {
++                    off = ftell(usf_trace_pcm);
++                    fwrite(tr_run, 2, tr_n, usf_trace_pcm);
++                    cv->len = tv->cum + cnt;
++                }
++                fprintf(usf_trace_f, "A %u %u %u %u %x %x %lx %ld %ld %u\n", init ? 1u : 0u, 0u, 0u, cnt,
++                        last_sample_ptr, p2, (unsigned long)h, tv->cum, off, 1u);
++                tv->cum += cnt;
++            }
++            /* pitch_shift Q4.12 -> эквивалент ABI1-значения (ratio = pitch*2/65536) */
++            fprintf(usf_trace_f, "R %u %u %x %u %u %u\n", 0u, (unsigned)pitch_shift * 8u, last_sample_ptr, 0u, 0u, SUBFRAME_SIZE);
++            fprintf(usf_trace_f, "E %u %u %u %u %d %d %d %d %d %d %d %d %x\n", 0u, 0u, 0u, SUBFRAME_SIZE,
++                    (int)(tr_env0[0] >> 16), (int)(tr_env0[1] >> 16),
++                    (int)(v4_env[0] >> 16), (int)(v4_env[1] >> 16), 0, 0, 32768, 0, last_sample_ptr);
++            tv->has = 1;
++            tv->prev_p1 = p1; tv->prev_p2 = p2; tv->prev_z1 = z1; tv->prev_z2 = z2;
++        }
++    }
++
+     /* save last resampled sample */
+     dram_store_u16(hle, (uint16_t *)v4, last_sample_ptr, 4);
+ 
 diff --git a/rsp_hle/trace.c b/rsp_hle/trace.c
 new file mode 100644
 index 0000000..f7f17be
@@ -260,7 +379,7 @@ index 0000000..f7f17be
 +}
 diff --git a/rsp_hle/trace.h b/rsp_hle/trace.h
 new file mode 100644
-index 0000000..a783b22
+index 0000000..68beb51
 --- /dev/null
 +++ b/rsp_hle/trace.h
 @@ -0,0 +1,15 @@
@@ -274,7 +393,7 @@ index 0000000..a783b22
 +extern uint16_t usf_last_load_in;
 +extern unsigned usf_last_load_cnt;
 +extern FILE *usf_trace_f, *usf_trace_pcm;
-+struct usf_voice { uint32_t addr; long cum; unsigned hash; int has; int used; };
++struct usf_voice { uint32_t addr; long cum; unsigned hash; int has; int used; uint32_t prev_p1, prev_p2; uint16_t prev_z1, prev_z2; };
 +struct usf_cov { unsigned hash; long len; int used; };
 +struct usf_voice *usf_voice_get(uint32_t addr);
 +struct usf_cov *usf_cov_get(unsigned hash);

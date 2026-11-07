@@ -645,7 +645,7 @@ inline double cell_float(const Note & n, int idx, const Sample & s, double shift
 inline std::string convert(const Trace & tr, const std::vector<int16_t> & pcm, const std::string & base,
                            const std::string & title, bool want_xm, bool want_midi, const Options & o)
 {
-    if (tr.voices.empty()) return "no ADPCM/ENVMIXER voices in the log (only standard libultra ABI1 is supported)";
+    if (tr.voices.empty()) return "no ADPCM/ENVMIXER voices in the log (supported: libultra ABI1 and MusyX v1/v2; ABI2/ABI3 are not)";
     const auto & frame_times = tr.frame_times;
     double rate = tr.rate;
     auto notes_v = build_notes(tr.voices, o.release_threshold);

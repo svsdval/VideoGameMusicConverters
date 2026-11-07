@@ -77,7 +77,7 @@ python3 usf2xm-midi-wav.py --build-tracer                      # (optional) buil
 ```
 Other options: `--seconds` (default: `length`+`fade` tags, else 120), `--channels` (32), `--release-threshold` (0.04), `--bend-threshold` (0.75 semitones, bigger changes become `3FF` glides), `--no-pan`, `--keep-trace`.
 
-Limitations: only the standard libultra audio ABI1 microcode (ABI2/ABI3/MusyX games give a warning and no notes; the Python emulator has no other ucode at all); envelopes are
+Limitations: only the libultra audio ABI1 and MusyX v1/v2 microcodes (007: The World Is Not Enough, Rogue Squadron, Indiana Jones, ...); ABI2/ABI3 games give a warning and no notes; the Python emulator knows only ABI1, MusyX needs the native tracer (rebuild it with `--build-tracer` after updating); envelopes are
 approximated with volume-column steps; sample reverb (aux bus) is not reproduced in XM/MIDI (it is in the WAV).
 
 ## NSF (NES) -> XM / MIDI / WAV
@@ -251,7 +251,7 @@ python3 usf2xm-midi-wav.py --build-tracer                      # (опциона
 ```
 Прочие опции: `--seconds` (по умолчанию теги `length`+`fade`, иначе 120), `--channels` (32), `--release-threshold` (0.04), `--bend-threshold` (0.75 полутона, большие изменения становятся глиссандо `3FF`), `--no-pan`, `--keep-trace`.
 
-Ограничения: только стандартный аудио-микрокод libultra ABI1 (игры с ABI2/ABI3/MusyX дают предупреждение и ноты не получаются; в Python-эмуляторе другого ucode нет вообще);
+Ограничения: аудио-микрокоды libultra ABI1 и MusyX v1/v2 (007: The World Is Not Enough, Rogue Squadron, Indiana Jones и др.); игры с ABI2/ABI3 дают предупреждение и ноты не получаются; Python-эмулятор знает только ABI1, для MusyX нужен нативный трассировщик (пересоберите: `--build-tracer`);
 огибающие аппроксимируются ступенями volume-колонки; реверберация сэмплов (aux-шина) не переносится в XM/MIDI (есть в WAV).
 
 ## NSF (NES) -> XM / MIDI / WAV

@@ -66,3 +66,24 @@ index 4e65113..0849fb8 100644
      uint32_t uc_start = *dmem_u32(hle, TASK_UCODE);
      uint32_t uc_dstart = *dmem_u32(hle, TASK_UCODE_DATA);
      uint32_t uc_dsize = *dmem_u32(hle, TASK_UCODE_DATA_SIZE);
+diff --git a/rsp_hle/musyx.c b/rsp_hle/musyx.c
+index bdee40d..2284506 100644
+--- a/rsp_hle/musyx.c
++++ b/rsp_hle/musyx.c
+@@ -486,8 +486,14 @@ static uint32_t voice_stage(struct hle_t* hle, musyx_t *musyx,
+                 load_samples_ADPCM(hle, voice_ptr, samples, &segbase, &offset);
+ 
+             /* mix them with each internal subframes */
+-            mix_voice_samples(hle, musyx, voice_ptr, samples, segbase, offset,
+-                              last_sample_ptr + i * 8);
++            {
++                extern uint32_t usf_voice_mute_mask;   /* Audacious plugin: мьют слота голоса */
++                if (i < 32 && ((usf_voice_mute_mask >> i) & 1))
++                    ((void)0);
++                else
++                    mix_voice_samples(hle, musyx, voice_ptr, samples, segbase, offset,
++                                      last_sample_ptr + i * 8);
++            }
+ 
+             /* check break condition */
+             output_ptr = *dram_u32(hle, voice_ptr + VOICE_INTERLEAVED_PTR);
