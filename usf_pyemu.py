@@ -274,6 +274,7 @@ class N64:
         self.aidacrate = 48681812
         # выход аудио
         self.audio_rate = 0
+        self.vi_without_audio = 0
         self.audio_out = []            # list of bytes chunks (стерео 16 бит, little-endian пары L,R после перестановки)
         self.audio_samples = 0
         # трассировка
@@ -1025,6 +1026,16 @@ class N64:
         self.vi_field ^= (self.vi[0] >> 6) & 1
         self.vi_next = (self.cp0[CP0_COUNT] + self.vi_delay) & M32
         self.add_event_count(VI_INT, self.vi_next)
+        # игра перестала выдавать звук (SFX закончился, пауза): без тишины цикл ждал бы вечно
+        # (как silence.patch в lazyusf2): через ~1 с без AI-данных досыпаем нули на каждый кадр VI
+        self.vi_without_audio += 1
+        if self.vi_without_audio > 60 and self.audio_rate > 0:
+            n = min(4096, self.audio_rate * self.vi_delay // 93750000)
+            if n:
+                self.audio_out.append(bytes(n * 4))
+                self.audio_samples += n
+                if self.target_samples and self.audio_samples >= self.target_samples:
+                    self.stop_request = True
         return self.raise_rcp_interrupt(MI_INTR_VI, pc)
 
     # AI
@@ -1060,6 +1071,7 @@ class N64:
             self.add_event(AI_INT, dma['duration'] if self.g_delay_ai else 0)
 
     def push_audio(self, address, length):
+        self.vi_without_audio = 0
         data = self.dram_read_bytes(address & 0xFFFFFF, length)
         self.audio_out.append(data)
         self.audio_samples += length // 4
@@ -4084,6 +4096,10 @@ class Hle(AlistExtra, MusyxMixin):
         return self.unknown_task
 
     def unknown_task(self):
+        # графическую задачу не исполняем, но игра ждёт прерывание DP (full sync) от RDP:
+        # без него её планировщик встаёт и аудио-задачи перестают приходить (gfxdone.patch)
+        if self.m.spmem[0xFC0 >> 2] == 1:
+            self.m.mi[2] |= MI_INTR_DP
         self.m.rsp_break(0x200)
 
     def unknown_ucode(self):
@@ -4545,6 +4561,7 @@ def _attach(m):
     m.run_rsp_task = run_rsp_task
 
     def push_audio(address, length):
+        m.vi_without_audio = 0
         data = m.dram_read_bytes(address & 0xFFFFFF, length)
         m.audio_out.append(data)
         m.audio_samples += length // 4
