@@ -13,6 +13,10 @@ cd lazyusf2
 if [ ! -f rsp_hle/trace.c ]; then
     git apply "$HERE/usftrace.patch"
 fi
+# досыпание тишины, если игра перестала выдавать звук (иначе usf_render зависает навсегда)
+grep -q vi_without_audio usf/usf_internal.h || git apply "$HERE/silence.patch"
+# игра ждёт прерывание DP после пропущенной графической задачи, иначе её планировщик встаёт
+grep -q MI_INTR_DP rsp_hle/hle.c || git apply "$HERE/gfxdone.patch"
 rm -f test/*.o        # в репозитории лежат устаревшие объектные файлы
 make -j"$(nproc)" liblazyusf.a
 make usftrace

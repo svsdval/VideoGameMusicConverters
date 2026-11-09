@@ -1,0 +1,51 @@
+diff --git a/usf/usf.c b/usf/usf.c
+index 5685238..1c1f9d5 100644
+--- a/usf/usf.c
++++ b/usf/usf.c
+@@ -240,6 +240,7 @@ void usf_push_audio_samples(void *opaque, const void * buffer, size_t size)
+     size_t samplesTodo;
+     size_t i;
+     size /= 4;
++    state->vi_without_audio = 0;
+ 
+     samplesTodo = size;
+     if (samplesTodo > state->sample_buffer_count)
+diff --git a/usf/usf_internal.h b/usf/usf_internal.h
+index b5f51b4..fc85e42 100644
+--- a/usf/usf_internal.h
++++ b/usf/usf_internal.h
+@@ -267,6 +267,8 @@ struct usf_state
+     // SampleRate is usually guaranteed to stay the same for the duration
+     // of a given track, and depends on the game.
+     int32_t SampleRate;
++    // кадры VI подряд без аудио от игры (см. vi_vertical_interrupt_event)
++    unsigned int vi_without_audio;
+     // Audio is rendered in whole Audio Interface DMA transfers, which are
+     // then copied directly to the caller's buffer. Any left over samples
+     // from the last DMA transfer that fills the caller's buffer will be
+diff --git a/vi/vi_controller.c b/vi/vi_controller.c
+index 1b94400..15de0c5 100644
+--- a/vi/vi_controller.c
++++ b/vi/vi_controller.c
+@@ -121,6 +121,21 @@ void vi_vertical_interrupt_event(struct vi_controller* vi)
+     vi->next_vi = state->g_cp0_regs[CP0_COUNT_REG] + vi->delay;
+     add_interupt_event_count(state, VI_INT, vi->next_vi);
+ 
++    /* Игра перестала выдавать звук (SFX закончился, пауза и т.п.): без AI-данных
++       usf_render() не вернулся бы никогда. Через ~1 с тишины досыпаем нули на каждый кадр VI. */
++    if (++state->vi_without_audio > 60 && state->SampleRate > 0)
++    {
++        static const int16_t zeros[2 * 4096];
++        size_t n = (size_t)((uint64_t)state->SampleRate * vi->delay / 93750000u);
++        if (n > 4096) n = 4096;
++        if (n)
++        {
++            unsigned int keep = state->vi_without_audio;
++            usf_push_audio_samples(state, zeros, n * 4);
++            state->vi_without_audio = keep;
++        }
++    }
++
+     /* trigger interrupt */
+     raise_rcp_interrupt(vi->r4300, MI_INTR_VI);
+ }

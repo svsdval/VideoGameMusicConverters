@@ -16,6 +16,8 @@ rm -f lazyusf2/test/*.o
 (cd lazyusf2 &&
  { [ -f rsp_hle/trace.c ] || git apply "$HERE/../usf_tracer/usftrace.patch"; } &&
  { grep -q usf_voice_mute_mask rsp_hle/alist.c || git apply "$HERE/voicemute.patch"; } &&
+ { grep -q vi_without_audio usf/usf_internal.h || git apply "$HERE/../usf_tracer/silence.patch"; } &&
+ { grep -q "MI_INTR_DP" rsp_hle/hle.c || git apply "$HERE/../usf_tracer/gfxdone.patch"; } &&
  { grep -q usf_trace_reset rsp_hle/trace.c || cat >> rsp_hle/trace.c <<'EOT'
 
 #include <string.h>

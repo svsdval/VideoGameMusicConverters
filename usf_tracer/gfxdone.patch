@@ -1,0 +1,12 @@
+--- a/rsp_hle/hle.c
++++ b/rsp_hle/hle.c
+@@ -232,6 +232,9 @@
+     if (HleForwardTask(hle->user_defined) != 0) {
+ 
+         /* Send task_done signal for unknown ucodes to allow further processings */
++        /* Графическую задачу не исполняем, но игра ждёт от RDP прерывание DP (full sync):
++           без него её планировщик встаёт и аудио-задачи перестают приходить. */
++        if (*dmem_u32(hle, TASK_TYPE) == 1) *hle->mi_intr |= 0x20; /* MI_INTR_DP */
+         rsp_break(hle, SP_STATUS_TASKDONE);
+ 
+         uint32_t uc_start = *dmem_u32(hle, TASK_UCODE);
