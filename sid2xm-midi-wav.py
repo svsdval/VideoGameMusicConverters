@@ -11,6 +11,9 @@ import struct, sys, os, math
 from dataclasses import dataclass, field
 from typing import List, Dict, Tuple, Optional
 
+from midi_export import tempo_event, text_event, write_smf
+from xm_export import ENV_FLAT_PAN_LOOP, Cell, XmInstrument, XmSample, grid_to_patterns, write_xm
+
 NOTE_NAMES = ['C-','C#','D-','D#','E-','F-',
               'F#','G-','G#','A-','A#','B-']
 
@@ -724,9 +727,6 @@ def extract_notes_sid(frames_regs,channel_map,clock,num_chips=1):
 # ═══════════════════════════════════════════════════════════════
 
 @dataclass
-class TN:
-    note:int=0;instrument:int=0;volume:int=0;effect:int=0;effect_param:int=0
-
 class SIDGen:
     P=32
     @classmethod
@@ -744,96 +744,36 @@ class SIDGen:
             s.append(24000 if(l&1)else -24000)
         return s
 
-class XMWriter:
-    def build_and_write(self,fn,events,title="",bpm=125,speed=6,fr=50,nc=6):
-        if nc%2:nc+=1
-        nc=max(4,min(32,nc));insts=self._mi();rps=speed*2.5/bpm;fpr=max(1,int(fr*rps))
-        rd={}
-        for ev in events:
-            if ev.event_type not in('note_on','note_off'):continue
-            row=ev.frame//fpr;ch=ev.channel
-            if ch>=nc:continue
-            k=(row,ch)
-            if ev.event_type=='note_on':rd[k]=TN(max(1,min(96,ev.note)),min(ev.instrument,len(insts)),0x10+min(0x40,max(0,ev.volume)))
-            elif ev.event_type=='note_off' and k not in rd:rd[k]=TN(97)
-        mr=max((k[0]for k in rd),default=0)+1;rpp=64;np=max(1,min(256,(mr+rpp-1)//rpp))
-        pats=[]
-        for pi in range(np):
-            pat=[]
-            for ri in range(rpp):
-                row=[TN()for _ in range(nc)]
-                for ch in range(nc):
-                    k=(pi*rpp+ri,ch)
-                    if k in rd:row[ch]=rd[k]
-                pat.append(row)
-            pats.append(pat)
-        self._wx(fn,title,nc,bpm,speed,pats,insts,list(range(np)))
-    def _mi(self):
-        g=SIDGen
-        def mk(n,p,l=True):
-            return{'name':n[:22],'samples':[{'name':n[:22],'data':p,'length':len(p),'loop_start':0,'loop_length':len(p)if l else 0,'loop_type':1 if l else 0,'volume':64,'finetune':0,'panning':128,'relative_note':0,'bits':16}]}
-        return[mk("SID Triangle",g.triangle()),mk("SID Sawtooth",g.sawtooth()),
-               mk("SID Pulse",g.pulse()),mk("SID Noise",g.noise(),l=False)]
-    def _wx(self,fn,title,nc,bpm,speed,pats,insts,order):
-        with open(fn,'wb') as f:
-            f.write(b'Extended Module: ');f.write(title.encode('ascii','replace')[:20].ljust(20,b'\x00'))
-            f.write(b'\x1a');f.write(b'SID2XM Converter    ')
-            f.write(struct.pack('<HIHHHHHHH',0x0104,276,len(order),0,nc,len(pats),min(len(insts),128),1,speed)+struct.pack('<H',bpm))
-            ot=bytearray(256)
-            for i,o in enumerate(order[:256]):ot[i]=o
-            f.write(ot)
-            for pat in pats:
-                pk=bytearray()
-                for row in pat:
-                    for ch in range(nc):
-                        nd=row[ch]if ch<len(row)else TN()
-                        hn=nd.note>0;hi=nd.instrument>0;hv=nd.volume>0;hf=nd.effect>0;hp=nd.effect_param>0
-                        if not(hn or hi or hv or hf or hp):pk.append(0x80)
-                        else:
-                            pb=0x80|(1 if hn else 0)|(2 if hi else 0)|(4 if hv else 0)|(8 if hf else 0)|(16 if hp else 0)
-                            pk.append(pb)
-                            if hn:pk.append(nd.note&0xFF)
-                            if hi:pk.append(nd.instrument&0xFF)
-                            if hv:pk.append(nd.volume&0xFF)
-                            if hf:pk.append(nd.effect&0xFF)
-                            if hp:pk.append(nd.effect_param&0xFF)
-                f.write(struct.pack('<IBH',9,0,len(pat))+struct.pack('<H',len(pk))+pk)
-            for inst in insts[:128]:
-                ss=inst.get('samples',[])
-                if not ss:f.write(struct.pack('<I',29)+inst['name'].encode('ascii','replace')[:22].ljust(22,b'\x00')+struct.pack('<BH',0,0));continue
-                ihs=263;f.write(struct.pack('<I',ihs)+inst['name'].encode('ascii','replace')[:22].ljust(22,b'\x00'))
-                f.write(struct.pack('<BHI',0,len(ss),40)+bytearray(96))
-                ve=bytearray(48);struct.pack_into('<HH',ve,0,0,64);struct.pack_into('<HH',ve,4,100,64);f.write(ve)
-                pe=bytearray(48);struct.pack_into('<HH',pe,0,0,32);struct.pack_into('<HH',pe,4,100,32);f.write(pe)
-                f.write(bytes([2,2,0,0,1,0,0,1,1,0,0,0,0,0])+struct.pack('<H',0x800))
-                rem=ihs-(4+22+1+2+4+96+48+48+14+2)
-                if rem>0:f.write(b'\x00'*rem)
-                for s in ss:
-                    bps=2 if s.get('bits',16)==16 else 1
-                    f.write(struct.pack('<III',len(s['data'])*bps,s['loop_start']*bps,s['loop_length']*bps))
-                    f.write(struct.pack('<Bb',s.get('volume',64),max(-128,min(127,s.get('finetune',0)))))
-                    tb=s.get('loop_type',0)&3
-                    if s.get('bits',16)==16:tb|=0x10
-                    f.write(struct.pack('<BBbB',tb,s.get('panning',128),max(-128,min(127,s.get('relative_note',0))),0))
-                    f.write(s.get('name','').encode('ascii','replace')[:22].ljust(22,b'\x00'))
-                for s in ss:
-                    prev=0
-                    for v in s['data']:v=max(-32768,min(32767,v));d_=(((v-prev)+32768)%65536-32768);f.write(struct.pack('<h',d_));prev=v
+def _sid_instruments():
+    g=SIDGen
+    def mk(n,p,l=True):
+        return XmInstrument(n[:22],[XmSample(p,n[:22],0,len(p)if l else 0)],
+                            fadeout=0x800,env_flags=ENV_FLAT_PAN_LOOP)
+    return[mk("SID Triangle",g.triangle()),mk("SID Sawtooth",g.sawtooth()),
+           mk("SID Pulse",g.pulse()),mk("SID Noise",g.noise(),l=False)]
+
+def build_and_write_xm(fn,events,title="",bpm=125,speed=6,fr=50,nc=6):
+    if nc%2:nc+=1
+    nc=max(4,min(32,nc));insts=_sid_instruments();rps=speed*2.5/bpm;fpr=max(1,int(fr*rps))
+    rd={}
+    for ev in events:
+        if ev.event_type not in('note_on','note_off'):continue
+        row=ev.frame//fpr;ch=ev.channel
+        if ch>=nc:continue
+        k=(row,ch)
+        if ev.event_type=='note_on':rd[k]=Cell(max(1,min(96,ev.note)),min(ev.instrument,len(insts)),0x10+min(0x40,max(0,ev.volume)))
+        elif ev.event_type=='note_off' and k not in rd:rd[k]=Cell(97)
+    mr=max((k[0]for k in rd),default=0)+1
+    write_xm(fn,title,'SID2XM Converter',nc,bpm,speed,grid_to_patterns(rd,mr,nc),insts)
 
 class MIDIWriter:
     def __init__(self):self.tpqn=480
-    @staticmethod
-    def _vlq(v):
-        if v<0:v=0
-        r=[v&0x7F];v>>=7
-        while v:r.append((v&0x7F)|0x80);v>>=7
-        r.reverse();return bytes(r)
     def write(self,fn,events,bpm=125,speed=6,fr=50,title=""):
-        tpqn=self.tpqn;tpf=tpqn*bpm/(60.0*fr);usec=int(60_000_000/bpm)
+        tpqn=self.tpqn;tpf=tpqn*bpm/(60.0*fr)
         chs={}
         for ev in events:chs.setdefault(ev.channel,[]).append(ev)
-        tracks=[];t0=[(0,bytes([0xFF,0x51,0x03,(usec>>16)&0xFF,(usec>>8)&0xFF,usec&0xFF]))]
-        if title:td=title.encode('ascii',errors='replace')[:127];t0.append((0,bytes([0xFF,0x01,len(td)])+td))
+        tracks=[];t0=[(0,tempo_event(bpm))]
+        if title:t0.append((0,text_event(title,0x01,127)))
         tracks.append(t0);gm=[81,82,80,127]
         for ci,ch in enumerate(sorted(chs.keys())):
             if ci>=15:break
@@ -848,13 +788,7 @@ class MIDIWriter:
                     if ch in act:pn,_=act[ch];trk.append((mt,bytes([0x80|mc,pn,0])));del act[ch]
             for pn,pt in act.values():trk.append((pt+tpqn,bytes([0x80|mc,pn,0])))
             tracks.append(trk)
-        with open(fn,'wb') as f:
-            f.write(b'MThd'+struct.pack('>I',6)+struct.pack('>HHH',1,len(tracks),tpqn))
-            for t in tracks:
-                t.sort(key=lambda x:x[0]);d=bytearray();prev=0
-                for at,ed in t:d.extend(self._vlq(max(0,at-prev)));d.extend(ed);prev=at
-                d.extend(self._vlq(0));d.extend(b'\xFF\x2F\x00')
-                f.write(b'MTrk'+struct.pack('>I',len(d))+d)
+        write_smf(fn,[[(at,i,ed)for i,(at,ed)in enumerate(t)]for t in tracks],tpqn)
 
 # ═══════════════════════════════════════════════════════════════
 # Main
@@ -863,7 +797,7 @@ class MIDIWriter:
 def convert_sid(input_file,output_file=None,fmt='xm',midi_file=None,wav_file=None,
                 channel_map_spec='default',raw_notes=False,sample_rate=44100,
                 wav_volume=0.8,song=None,seconds=60.0,clock_override=None,
-                sid_model_override=None,sids_override=None,mono=False):
+                sid_model_override=None,sids_override=None,mono=False,mmpz=False,mmpz_embed=False):
     base=os.path.splitext(input_file)[0]
     if not output_file:output_file=base+'.xm'
     with open(input_file,'rb') as f:data=f.read()
@@ -903,7 +837,7 @@ def convert_sid(input_file,output_file=None,fmt='xm',midi_file=None,wav_file=Non
         dur=render_wav(frames_regs,wf,sample_rate,clock,sid_model,frame_rate,wav_volume,
                         num_chips,not mono)
         print(f"  WAV: {wf} ({os.path.getsize(wf)/1024:.1f} KB, {dur:.1f}s)")
-        if fmt=='wav' and not midi_file:
+        if fmt=='wav' and not midi_file and not mmpz:
             print(f"\nГотово!")
             return
 
@@ -916,7 +850,7 @@ def convert_sid(input_file,output_file=None,fmt='xm',midi_file=None,wav_file=Non
 
     note_ons=[e for e in events if e.event_type=='note_on']
     print(f"  Mode: {mode_str}, Notes: {len(note_ons)}")
-    if not note_ons and fmt not in('wav',):
+    if not note_ons and (fmt not in('wav',) or mmpz):
         print("  No notes!");return
 
     bpm=125;speed=6
@@ -924,10 +858,14 @@ def convert_sid(input_file,output_file=None,fmt='xm',midi_file=None,wav_file=Non
     if xm_nc<num_xm:
         print(f"  Внимание: {num_xm} XM-каналов не влезает в лимит 32, часть голосов будет потеряна")
 
-    if fmt in('xm','both','all'):
+    if fmt in('xm','both','all')or mmpz:
         xf=output_file if output_file.endswith('.xm')else base+'.xm'
-        XMWriter().build_and_write(xf,events,header.name,bpm,speed,frame_rate,num_xm)
+        build_and_write_xm(xf,events,header.name,bpm,speed,frame_rate,num_xm)
         print(f"  XM: {xf} ({os.path.getsize(xf)/1024:.1f} KB, {xm_nc} ch)")
+        if mmpz:
+            import mmpz_export
+            mmpz_export.export_after_xm(xf,embed=mmpz_embed,keep_xm=fmt in('xm','both','all'),
+                                        log=lambda m:print('  '+m))
 
     if fmt in('midi','both','all')or midi_file:
         mf=midi_file or base+'.mid'
@@ -950,7 +888,8 @@ Output formats:
   --midi        XM + MIDI
   --midi-only   MIDI only
   --wav         WAV only (SID emulation)
-  --all         XM + MIDI + WAV
+  --mmpz        XM + LMMS project (.mmpz)
+  --all         XM + MIDI + WAV + LMMS
 
 SID options:
   --song N        Subtune number, 1-based (default: header's start song)
@@ -983,7 +922,9 @@ Examples:
     ap.add_argument('--midi-file',type=str,default=None)
     ap.add_argument('--wav',action='store_true',help='Render WAV')
     ap.add_argument('--wav-file',type=str,default=None)
-    ap.add_argument('--all',action='store_true',help='Output XM+MIDI+WAV')
+    ap.add_argument('--mmpz',action='store_true',help='XM + LMMS project (.mmpz)')
+    ap.add_argument('--mmpz-embed',action='store_true',help='embed samples in .mmpz (default: WAVs in <name>_samples/)')
+    ap.add_argument('--all',action='store_true',help='Output XM+MIDI+WAV+LMMS')
     ap.add_argument('--sample-rate',type=int,default=44100)
     ap.add_argument('--wav-volume',type=float,default=0.8)
     ap.add_argument('--channel-map',type=str,default='default')
@@ -1020,7 +961,7 @@ Examples:
             convert_sid(inp,args.output,fmt,args.midi_file,args.wav_file,
                         args.channel_map,args.raw_notes,args.sample_rate,
                         args.wav_volume,args.song,args.seconds,args.clock,
-                        args.sid_model,args.sids,args.mono)
+                        args.sid_model,args.sids,args.mono,args.mmpz or args.all,args.mmpz_embed)
         except Exception as e:
             import traceback;print(f"Error: {e}");traceback.print_exc()
     print("\nГотово!")

@@ -6,6 +6,9 @@ With channel mapping, --raw-notes mode, and WAV rendering
 
 import struct, sys, os, math, array
 import numpy as np
+
+from midi_export import tempo_event, text_event, write_smf
+from xm_export import ENV_OFF_PAN_LOOP, Cell, XmInstrument, grid_to_patterns, write_xm
 from dataclasses import dataclass, field
 from typing import List, Dict, Tuple, Optional
 
@@ -732,113 +735,44 @@ def extract_notes_ay(frames, channel_map, clock=CLOCK, is_ym=False, scale=1.0):
 # XM & MIDI writers
 # ═══════════════════════════════════════════════════════════════
 
-@dataclass
-class TN:
-    note: int = 0; instrument: int = 0; volume: int = 0; effect: int = 0; effect_param: int = 0
-
-class XMWriter:
-    ROWS_PER_PATTERN = 128
-
-    def build_and_write(self, fn, events, title="", nc=6, is_ym=False, fps=FPS):
-        if nc % 2: nc += 1
-        nc = max(4, min(32, nc))
-        # one row per player frame: 2 ticks of 1/(2*fps) s (3xx needs >= 2 ticks per row)
-        speed, bpm = 2, int(round(5 * fps))
-        slide_ok = bpm <= 255
-        if not slide_ok:
-            speed, bpm = 1, max(32, min(255, int(round(2.5 * fps))))
-        insts = instruments(is_ym)
-        cells = {}
-        for ev in events:
-            row, ch = ev.frame, ev.channel
-            if ch >= nc: continue
-            c = cells.setdefault((row, ch), TN())
-            if ev.event_type == 'note_on':
-                c.note, c.instrument, c.volume = max(1, min(96, ev.note)), ev.instrument, 0x10 + ev.volume
-                c.effect = c.effect_param = 0
-            elif ev.event_type == 'pitch':
-                if c.note != 97 and not (c.note and c.instrument):   # not over a fresh note
-                    c.note = max(1, min(96, ev.note))
-                    if slide_ok: c.effect, c.effect_param = 3, 0xFF
-                    else: c.instrument = ev.instrument      # no ticks for 3xx: re-trigger
-                    c.volume = c.volume or 0x10 + ev.volume
-            elif ev.event_type == 'vol':
-                if c.note != 97 and not (c.note and c.instrument):
-                    c.volume = 0x10 + ev.volume
-            elif ev.event_type == 'note_off':
-                if not c.note: c.note = 97
-        rpp = self.ROWS_PER_PATTERN
-        max_row = max((k[0] for k in cells), default=0) + 1
-        np_ = max(1, min(256, (max_row + rpp - 1) // rpp))
-        if (max_row + rpp - 1) // rpp > 256:
-            print("  Warning: song is longer than 256 patterns, truncated")
-        pats = []
-        for pi in range(np_):
-            pat = []
-            for ri in range(rpp):
-                pat.append([cells.get((pi * rpp + ri, ch), TN()) for ch in range(nc)])
-            pats.append(pat)
-        self._wx(fn, title, nc, bpm, speed, pats, insts, list(range(np_)))
-
-    def _wx(self, fn, title, nc, bpm, speed, pats, insts, order):
-        with open(fn, 'wb') as f:
-            f.write(b'Extended Module: ')
-            f.write(title.encode('ascii', 'replace')[:20].ljust(20, b'\x00'))
-            f.write(b'\x1a')
-            f.write(b'PT32XM Converter    ')
-            f.write(struct.pack('<HIHHHHHHH', 0x0104, 276, len(order), 0, nc, len(pats),
-                                min(len(insts), 128), 1, speed) + struct.pack('<H', bpm))
-            ot = bytearray(256)
-            for i, o in enumerate(order[:256]): ot[i] = o
-            f.write(ot)
-            for pat in pats:
-                pk = bytearray()
-                for row in pat:
-                    for ch in range(nc):
-                        nd = row[ch] if ch < len(row) else TN()
-                        hn, hi, hv = nd.note > 0, nd.instrument > 0, nd.volume > 0
-                        hf, hp = nd.effect > 0, nd.effect_param > 0
-                        if not (hn or hi or hv or hf or hp):
-                            pk.append(0x80)
-                        else:
-                            pk.append(0x80 | (1 if hn else 0) | (2 if hi else 0) | (4 if hv else 0) |
-                                      (8 if hf else 0) | (16 if hp else 0))
-                            if hn: pk.append(nd.note & 0xFF)
-                            if hi: pk.append(nd.instrument & 0xFF)
-                            if hv: pk.append(nd.volume & 0xFF)
-                            if hf: pk.append(nd.effect & 0xFF)
-                            if hp: pk.append(nd.effect_param & 0xFF)
-                f.write(struct.pack('<IBH', 9, 0, len(pat)) + struct.pack('<H', len(pk)) + pk)
-            for inst in insts[:128]:
-                data = inst['data']
-                ihs = 263
-                f.write(struct.pack('<I', ihs) + inst['name'].encode('ascii', 'replace')[:22].ljust(22, b'\x00'))
-                f.write(struct.pack('<BHI', 0, 1, 40) + bytearray(96))
-                ve = bytearray(48); struct.pack_into('<HHHH', ve, 0, 0, 64, 100, 64); f.write(ve)
-                pe = bytearray(48); struct.pack_into('<HHHH', pe, 0, 0, 32, 100, 32); f.write(pe)
-                # envelopes off, fadeout 0: note-off (97) cuts the sound at once
-                f.write(bytes([2, 2, 0, 0, 1, 0, 0, 1, 0, 0, 0, 0, 0, 0]))
-                f.write(struct.pack('<H', 0))
-                f.write(b'\x00' * (ihs - (4 + 22 + 1 + 2 + 4 + 96 + 48 + 48 + 14 + 2)))
-                n = len(data)
-                f.write(struct.pack('<III', n * 2, 0, n * 2 if inst['loop'] else 0))
-                f.write(struct.pack('<BbBBb', 64, 0, (1 if inst['loop'] else 0) | 0x10, 128, inst['rel']))
-                f.write(b'\x00')
-                f.write(inst['name'].encode('ascii', 'replace')[:22].ljust(22, b'\x00'))
-                prev = 0
-                for v in data:
-                    f.write(struct.pack('<h', ((v - prev + 32768) % 65536) - 32768)); prev = v
+def build_and_write_xm(fn, events, title="", nc=6, is_ym=False, fps=FPS):
+    """События AY -> XM: одна строка на кадр плеера, 2 тика на строку (для 3xx нужно >= 2 тиков)."""
+    if nc % 2: nc += 1
+    nc = max(4, min(32, nc))
+    speed, bpm = 2, int(round(5 * fps))
+    slide_ok = bpm <= 255
+    if not slide_ok:
+        speed, bpm = 1, max(32, min(255, int(round(2.5 * fps))))
+    # огибающие выключены, fadeout 0: note-off (97) режет звук сразу
+    insts = [XmInstrument.simple(i['name'], i['data'], (0, len(i['data'])) if i['loop'] else None, i['rel'],
+                                 env_flags=ENV_OFF_PAN_LOOP) for i in instruments(is_ym)]
+    cells = {}
+    for ev in events:
+        row, ch = ev.frame, ev.channel
+        if ch >= nc: continue
+        c = cells.setdefault((row, ch), Cell())
+        if ev.event_type == 'note_on':
+            c.note, c.inst, c.vol = max(1, min(96, ev.note)), ev.instrument, 0x10 + ev.volume
+            c.eff = c.par = 0
+        elif ev.event_type == 'pitch':
+            if c.note != 97 and not (c.note and c.inst):   # not over a fresh note
+                c.note = max(1, min(96, ev.note))
+                if slide_ok: c.eff, c.par = 3, 0xFF
+                else: c.inst = ev.instrument      # no ticks for 3xx: re-trigger
+                c.vol = c.vol or 0x10 + ev.volume
+        elif ev.event_type == 'vol':
+            if c.note != 97 and not (c.note and c.inst):
+                c.vol = 0x10 + ev.volume
+        elif ev.event_type == 'note_off':
+            if not c.note: c.note = 97
+    max_row = max((k[0] for k in cells), default=0) + 1
+    patterns = grid_to_patterns(cells, max_row, nc, rows_per_pattern=128)
+    write_xm(fn, title, 'PT32XM Converter', nc, bpm, speed, patterns, insts)
 
 
 class MIDIWriter:
     TPQN = 480
     PROGRAM = {MODE_TONE: 80, MODE_ENV_TONE: 81, MODE_BUZZER: 38, MODE_MIXED: 87, MODE_NOISE: 0}
-
-    @staticmethod
-    def _vlq(v):
-        v = max(0, int(v)); r = [v & 0x7F]; v >>= 7
-        while v: r.append((v & 0x7F) | 0x80); v >>= 7
-        r.reverse(); return bytes(r)
 
     @staticmethod
     def _drum(xm_note):
@@ -847,12 +781,10 @@ class MIDIWriter:
     def write(self, fn, events, bpm=125, fps=FPS, title=""):
         tpqn = self.TPQN
         tpf = tpqn * bpm / (60.0 * fps)
-        usec = int(60_000_000 / bpm)
         by_ch = {}
         for ev in events: by_ch.setdefault(ev.channel, []).append(ev)
-        t0 = [(0, bytes([0xFF, 0x51, 0x03, (usec >> 16) & 0xFF, (usec >> 8) & 0xFF, usec & 0xFF]))]
-        if title:
-            td = title.encode('ascii', errors='replace')[:127]; t0.append((0, bytes([0xFF, 0x01, len(td)]) + td))
+        t0 = [(0, tempo_event(bpm))]
+        if title: t0.append((0, text_event(title, 0x01, 127)))
         tracks = [t0]
         free = [c for c in range(16) if c != 9]
         for xc in sorted(by_ch):
@@ -894,14 +826,7 @@ class MIDIWriter:
                     off(t)
             off(last_t + 1)
             tracks.append(trk)
-        with open(fn, 'wb') as f:
-            f.write(b'MThd' + struct.pack('>IHHH', 6, 1, len(tracks), tpqn))
-            for t in tracks:
-                t.sort(key=lambda x: x[0]); d = bytearray(); prev = 0
-                for at, ed in t:
-                    d.extend(self._vlq(max(0, at - prev))); d.extend(ed); prev = at
-                d.extend(self._vlq(0)); d.extend(b'\xFF\x2F\x00')
-                f.write(b'MTrk' + struct.pack('>I', len(d)) + d)
+        write_smf(fn, [[(at, i, ed) for i, (at, ed) in enumerate(t)] for t in tracks], tpqn)
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -919,7 +844,7 @@ def convert_pt3(input_file, output_file=None, transpose=0, octave=0,
                 fmt='xm', midi_file=None, wav_file=None,
                 channel_map_spec='default', raw_notes=False,
                 sample_rate=44100, is_ym=False, wav_volume=0.8,
-                clock=CLOCK, norm_scale=1.0, layout='abc'):
+                clock=CLOCK, norm_scale=1.0, layout='abc', mmpz=False, mmpz_embed=False):
     base = os.path.splitext(input_file)[0]
     if not output_file: output_file = base + '.xm'
     with open(input_file, 'rb') as f: data = f.read()
@@ -941,7 +866,7 @@ def convert_pt3(input_file, output_file=None, transpose=0, octave=0,
         dur = render_wav((r for r, _ in pt3_frames(PT3Player(data), max_frames)), wf, sample_rate,
                          clock, is_ym, stereo=True, volume=wav_volume, layout=layout)
         print(f"  WAV: {wf} ({os.path.getsize(wf)/1024:.1f} KB, {dur:.1f}s)")
-        if fmt == 'wav' and not midi_file:
+        if fmt == 'wav' and not midi_file and not mmpz:
             print("\nГотово!")
             return
 
@@ -955,13 +880,17 @@ def convert_pt3(input_file, output_file=None, transpose=0, octave=0,
 
     note_ons = [e for e in events if e.event_type == 'note_on']
     print(f"  Mode: {mode_str}, Notes: {len(note_ons)}")
-    if not note_ons and fmt != 'wav':
+    if not note_ons and (fmt != 'wav' or mmpz):
         print("  No notes!"); return
 
-    if fmt in ('xm', 'both', 'all'):
+    if fmt in ('xm', 'both', 'all') or mmpz:
         xf = output_file if output_file.endswith('.xm') else base + '.xm'
-        XMWriter().build_and_write(xf, events, player.title, num_xm, is_ym)
+        build_and_write_xm(xf, events, player.title, num_xm, is_ym)
         print(f"  XM: {xf} ({os.path.getsize(xf)/1024:.1f} KB, {num_xm} ch)")
+        if mmpz:
+            import mmpz_export
+            mmpz_export.export_after_xm(xf, embed=mmpz_embed, keep_xm=fmt in ('xm', 'both', 'all'),
+                                        log=lambda m: print('  ' + m))
 
     if fmt in ('midi', 'both', 'all') or midi_file:
         mf = midi_file or base + '.mid'
@@ -1016,7 +945,9 @@ Examples:
     ap.add_argument('--midi-file', type=str, default=None)
     ap.add_argument('--wav', action='store_true', help='Render WAV')
     ap.add_argument('--wav-file', type=str, default=None)
-    ap.add_argument('--all', action='store_true', help='Output XM+MIDI+WAV')
+    ap.add_argument('--mmpz', action='store_true', help='XM + LMMS project (.mmpz)')
+    ap.add_argument('--mmpz-embed', action='store_true', help='embed samples in .mmpz (default: WAVs in <name>_samples/)')
+    ap.add_argument('--all', action='store_true', help='Output XM+MIDI+WAV+LMMS')
     ap.add_argument('--sample-rate', type=int, default=44100)
     ap.add_argument('--ym', action='store_true', help='Use YM DAC table')
     ap.add_argument('--clock', type=int, default=CLOCK)
@@ -1052,7 +983,8 @@ Examples:
         try:
             convert_pt3(inp, args.output, args.transpose, args.octave, fmt, args.midi_file,
                         args.wav_file, args.channel_map, args.raw_notes, args.sample_rate,
-                        args.ym, args.wav_volume, args.clock, args.norm_scale, args.layout)
+                        args.ym, args.wav_volume, args.clock, args.norm_scale, args.layout,
+                        args.mmpz or args.all, args.mmpz_embed)
         except Exception as e:
             import traceback; print(f"Error: {e}"); traceback.print_exc()
     print("\nГотово!")

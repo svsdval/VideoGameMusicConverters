@@ -39,6 +39,9 @@ import zlib
 
 import numpy as np
 
+from midi_export import DRUM_NOTES, GM_PROGRAMS, write_midi  # noqa: E402,F401
+from xm_export import Cell, XMWriter, XmInstrument
+
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 TRACER_DIR = os.path.join(HERE, 'usf_tracer')
@@ -543,12 +546,6 @@ def interval_to_bpm_speed(delta):
 # Распределение по каналам и событиям трекера
 # ═══════════════════════════════════════════════════════════════
 
-class Cell:
-    __slots__ = ('note', 'inst', 'vol', 'eff', 'par')
-
-    def __init__(self):
-        self.note = self.inst = self.vol = self.eff = self.par = 0
-
 
 def allocate_channels(notes, max_channels):
     """Жадно: свободный канал с тем же инструментом, иначе первый свободный,
@@ -593,146 +590,10 @@ def cell_float(note, ratio_idx, sample, shift):
 # XM writer
 # ═══════════════════════════════════════════════════════════════
 
-class XMWriter:
-    def __init__(self, title, nch, bpm, speed):
-        self.title = title
-        self.nch = nch
-        self.bpm = bpm
-        self.speed = speed
-        self.patterns = []
-        self.instruments = []
-
-    def set_rows(self, grid, nrows):
-        rpp = 64
-        npat = max(1, (nrows + rpp - 1) // rpp)
-        if npat > 256:
-            print(f"[xm] ВНИМАНИЕ: {npat} паттернов > 256, хвост обрезан "
-                  f"(используйте --compact)", file=sys.stderr)
-            npat = 256
-        self.patterns = []
-        for p in range(npat):
-            rows = []
-            for r in range(rpp):
-                rows.append([grid.get((p * rpp + r, c)) for c in range(self.nch)])
-            self.patterns.append(rows)
-
-    def write(self, path):
-        with open(path, 'wb') as f:
-            f.write(b'Extended Module: ')
-            f.write(self.title.encode('ascii', 'replace')[:20].ljust(20, b' '))
-            f.write(b'\x1a')
-            f.write(b'USF2XM Converter    ')
-            f.write(struct.pack('<H', 0x0104))
-            f.write(struct.pack('<I', 276))
-            f.write(struct.pack('<HHHHHHHH', len(self.patterns), 0, self.nch,
-                                len(self.patterns), len(self.instruments), 1,
-                                self.speed, self.bpm))
-            order = bytearray(256)
-            for i in range(len(self.patterns)):
-                order[i] = i
-            f.write(order)
-            for pat in self.patterns:
-                self._write_pattern(f, pat)
-            for inst in self.instruments:
-                self._write_instrument(f, inst)
-
-    def _write_pattern(self, f, pat):
-        packed = bytearray()
-        for row in pat:
-            for c in row:
-                if c is None or not (c.note or c.inst or c.vol or c.eff or c.par):
-                    packed.append(0x80)
-                    continue
-                flag = 0x80
-                if c.note: flag |= 1
-                if c.inst: flag |= 2
-                if c.vol: flag |= 4
-                if c.eff: flag |= 8
-                if c.par: flag |= 16
-                packed.append(flag)
-                if c.note: packed.append(c.note)
-                if c.inst: packed.append(c.inst)
-                if c.vol: packed.append(c.vol)
-                if c.eff: packed.append(c.eff)
-                if c.par: packed.append(c.par)
-        f.write(struct.pack('<IBHH', 9, 0, len(self.patterns[0]), len(packed)))
-        f.write(packed)
-
-    def _write_instrument(self, f, inst):
-        name = inst['name'].encode('ascii', 'replace')[:22].ljust(22, b'\x00')
-        data = inst['data']
-        ihs = 263
-        f.write(struct.pack('<I', ihs))
-        f.write(name)
-        f.write(struct.pack('<BH', 0, 1))
-        f.write(struct.pack('<I', 40))
-        f.write(bytearray(96))
-        ve = bytearray(48)
-        struct.pack_into('<HHHH', ve, 0, 0, 64, 100, 64)
-        f.write(ve)
-        pe = bytearray(48)
-        struct.pack_into('<HHHH', pe, 0, 0, 32, 100, 32)
-        f.write(pe)
-        f.write(bytes([2, 2, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0]))
-        f.write(struct.pack('<H', 0))
-        f.write(b'\x00' * (ihs - (4 + 22 + 1 + 2 + 4 + 96 + 48 + 48 + 14 + 2)))
-        # sample header (16 бит)
-        loop = inst['loop']
-        ls, ll = (loop if loop else (0, 0))
-        f.write(struct.pack('<III', len(data) * 2, ls * 2, ll * 2))
-        f.write(struct.pack('<BbBBb', 64, inst['finetune'], (1 if loop else 0) | 0x10,
-                            128, inst['rel']))
-        f.write(b'\x00')
-        f.write(name)
-        # дельта-кодирование
-        d = np.diff(data.astype(np.int32), prepend=0)
-        d = ((d + 32768) % 65536 - 32768).astype('<i2')
-        f.write(d.tobytes())
-
 
 # ═══════════════════════════════════════════════════════════════
 # MIDI writer
 # ═══════════════════════════════════════════════════════════════
-
-def vlq(v):
-    v = max(0, int(v))
-    out = [v & 0x7F]
-    v >>= 7
-    while v:
-        out.append((v & 0x7F) | 0x80)
-        v >>= 7
-    return bytes(reversed(out))
-
-
-DRUM_NOTES = [36, 38, 41, 43, 45, 42, 46, 49, 51, 39, 37, 56]
-GM_PROGRAMS = [0, 25, 33, 48, 80, 81, 73, 56, 4, 11, 19, 24, 38, 46, 52, 61,
-               71, 65, 87, 90, 95, 98, 104, 108]
-
-
-def write_midi(path, title, midi_events):
-    """midi_events: список (tick, order, bytes). Один трек на MIDI-канал."""
-    tpqn = 480
-    tracks = collections.defaultdict(list)
-    for tick, order, ch, data in midi_events:
-        tracks[ch].append((tick, order, data))
-    out = bytearray()
-    tempo = [(0, 0, bytes([0xFF, 0x51, 0x03]) + (500000).to_bytes(3, 'big'))]
-    if title:
-        t = title.encode('ascii', 'replace')[:100]
-        tempo.append((0, 1, bytes([0xFF, 0x03, len(t)]) + t))
-    all_tracks = [tempo] + [tracks[c] for c in sorted(tracks)]
-    out += b'MThd' + struct.pack('>IHHH', 6, 1, len(all_tracks), tpqn)
-    for tr in all_tracks:
-        tr = sorted(tr, key=lambda e: (e[0], e[1]))
-        body = bytearray()
-        prev = 0
-        for tick, _, data in tr:
-            body += vlq(tick - prev) + data
-            prev = tick
-        body += vlq(0) + b'\xFF\x2F\x00'
-        out += b'MTrk' + struct.pack('>I', len(body)) + body
-    with open(path, 'wb') as f:
-        f.write(out)
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -746,6 +607,9 @@ def convert(args):
 
     only = args.midi_only or args.wav_only
     want_xm = args.xm or args.all or not only
+    xm_keep = want_xm
+    want_mmpz = args.mmpz or args.all
+    want_xm = want_xm or want_mmpz
     want_midi = args.midi or args.all or args.midi_only
     want_wav = args.wav or args.all or args.wav_only
 
@@ -992,7 +856,7 @@ def convert(args):
                     if not c.eff:
                         c.eff, c.par = 0x0F, b
                         break
-            xm = XMWriter(title, nch, start_bpm, speed)
+            xm = XMWriter(title, nch, start_bpm, speed, tracker='USF2XM Converter')
             xm.set_rows(grid, last_row + 2)
             for h, s in sorted(samples.items(), key=lambda kv: kv[1].index):
                 data = s.data.astype(np.float64) * (32767.0 / s.peak)
@@ -1002,12 +866,14 @@ def convert(args):
                 fine = int(round((s.tune - rel) * 128))
                 fine = max(-128, min(127, fine))
                 nm = f"S{s.index:02d} {s.hash:08x}"
-                xm.instruments.append({'name': nm, 'data': data, 'loop': s.loop,
-                                       'rel': rel, 'finetune': fine})
+                xm.instruments.append(XmInstrument.simple(nm, data, s.loop, rel, fine))
             xm_path = base + '.xm'
             xm.write(xm_path)
             print(f"[xm] {xm_path}  ({len(xm.patterns)} паттернов, "
                   f"{len(xm.instruments)} инструментов)")
+            if want_mmpz:
+                import mmpz_export
+                mmpz_export.export_after_xm(xm_path, embed=args.mmpz_embed, keep_xm=xm_keep)
 
         # ── MIDI ──
         if want_midi:
@@ -1090,7 +956,10 @@ def main():
     ap.add_argument('--wav', action='store_true', help='+ WAV (рендер эмулятора, 44.1 кГц стерео)')
     ap.add_argument('--wav-only', action='store_true', help='только WAV')
     ap.add_argument('--wav-file', help='имя WAV файла')
-    ap.add_argument('--all', action='store_true', help='XM + MIDI + WAV')
+    ap.add_argument('--mmpz', action='store_true', help='XM + проект LMMS (.mmpz)')
+    ap.add_argument('--mmpz-embed', action='store_true',
+                    help='встроить сэмплы в .mmpz (по умолчанию WAV в <имя>_samples/)')
+    ap.add_argument('--all', action='store_true', help='XM + MIDI + WAV + LMMS')
     ap.add_argument('--seconds', type=float, help='сколько секунд эмулировать (по умолчанию length+fade из тегов, иначе 120)')
     ap.add_argument('--octave', type=int, default=0, help='сдвиг имён нот в октавах (звук не меняется)')
     ap.add_argument('--transpose', type=int, default=0, help='сдвиг имён нот в полутонах (звук не меняется)')

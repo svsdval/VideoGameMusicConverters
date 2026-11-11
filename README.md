@@ -28,7 +28,8 @@ Most `*2xm-midi-wav.py` scripts share these:
 | `-o NAME` | base name of the output files |
 | *(none)* / `--midi` / `--midi-only` | XM / XM + MIDI / MIDI only |
 | `--wav` / `--wav-only` / `--wav-file F` | add WAV / WAV only / WAV file name |
-| `--all` | XM + MIDI + WAV |
+| `--mmpz` / `--mmpz-embed` | add an LMMS project (`.mmpz`); embed the samples into it |
+| `--all` | XM + MIDI + WAV + LMMS |
 | `--seconds N` | how many seconds to emulate (if the length is not in the file) |
 | `--octave N`, `--transpose N` | shift note *names* only, the sound is unchanged |
 | `--compact N` | make rows N times coarser (fewer patterns) |
@@ -36,6 +37,33 @@ Most `*2xm-midi-wav.py` scripts share these:
 | `--norm-scale X` | XM volume scale (smaller = louder) |
 
 Run `python3 <script> --help` for the full list.
+
+## LMMS project (.mmpz)
+`--mmpz` adds `NAME.mmpz` (LMMS 1.2+) to any converter. It is built from the XM by the shared `mmpz_export.py` (numpy only, LMMS is not needed to create the file):
+
+* every XM instrument becomes an *AudioFileProcessor* instrument; notes sounding together on one instrument are spread over several tracks;
+* samples are written next to the project to `NAME_samples/*.wav` (44.1 kHz, already pitched so that LMMS key C4 = XM C-4, `relative note`/`finetune` included) and referenced by absolute path, so move the project together with that folder;
+  `--mmpz-embed` stores them inside the `.mmpz` instead (one file), but LMMS 1.2.2 loses embedded samples when exporting with `lmms -r` (not checked in the GUI);
+* loops are kept; the loop length is rounded to whole frames and the leftover is compensated with the track's *Pitch*, so looped chip waveforms stay in tune;
+* volume (volume column, `Cxx`) and panning (`8xx`) become automation of the track; smooth pitch changes (`3xx`) become *detuning* automation inside one note (no re-attack);
+* the tempo of the project is chosen so that an LMMS tick is much shorter than an XM row; note positions follow real time, XM tempo changes (`Fxx`) are respected;
+* the master volume is set automatically so the sum does not clip (`mmpz_export.py --gain N` to override).
+
+**`xm2mmpz.py`** converts any existing `.xm` (also not from these tools): `python3 xm2mmpz.py song.xm` -> `song.mmpz`; `--mmp` writes plain `.mmp`, `--embed` embeds the samples, `-d DIR` / `-o FILE` choose the output, several files at once are fine, `--bpm`/`--gain` override the automatic values. `python3 tests/mmpz_selftest.py` checks pitch, loops, bends and volume on a synthetic module (renders with `lmms` if it is installed).
+Limits: LMMS 1.2 has no per-note volume envelope, so volume changes inside a note go through the track automation; tempo is not exported as automation.
+
+## Shared writers
+All converters write their files through three common modules (no more per-script copies):
+
+| Module | Purpose |
+|---|---|
+| `xm_export.py` | XM writer: `Cell`, `XmSample`/`XmInstrument`, `grid_to_patterns`, `write_xm`, `XMWriter` |
+| `midi_export.py` | Standard MIDI File writer: `write_smf`, `write_midi`, `vlq`, tempo/text events, GM tables |
+| `mmpz_export.py` | LMMS project from an XM (see above) |
+
+Self-checks: `python3 tests/xm_midi_selftest.py` (XM/MIDI round trip), `python3 tests/mmpz_selftest.py` (LMMS project).
+Seamless loops: `xm_export.smooth_loop()` runs when any converter writes an XM (and when `mmpz_export.py` reads one). If the jump from the loop end back to its start is clearly worse than the sharpest spot inside the loop (this is what makes a sustained note crackle), it looks for a nearby loop start/end pair whose 32 preceding samples match best, so the wave continues smoothly; the data itself is not changed, only the loop points (the end is only moved towards the start). Normal loops (clean periods, saw edges, one-cycle chip waves) are left untouched. `XM_LOOP_FIX=0` in the environment turns this off.
+The module title in XM is padded with spaces (the PSG/PT3/SID scripts used to pad it with NUL bytes); all other bytes of the files are unchanged.
 
 ## SPC (SNES) -> XM / MIDI / WAV
 `spc_tracer/spctrace` = [Game Music Emu](https://github.com/libgme/game-music-emu) + a small patch in the S-DSP: it logs every voice start
@@ -202,7 +230,8 @@ Python-утилиты для конвертации музыки из видео
 | `-o NAME` | базовое имя выходных файлов |
 | *(нет)* / `--midi` / `--midi-only` | XM / XM + MIDI / только MIDI |
 | `--wav` / `--wav-only` / `--wav-file F` | добавить WAV / только WAV / имя WAV-файла |
-| `--all` | XM + MIDI + WAV |
+| `--mmpz` / `--mmpz-embed` | добавить проект LMMS (`.mmpz`); встроить сэмплы в него |
+| `--all` | XM + MIDI + WAV + LMMS |
 | `--seconds N` | сколько секунд эмулировать (если длина не указана в файле) |
 | `--octave N`, `--transpose N` | сдвиг только *имён* нот, звук не меняется |
 | `--compact N` | строки в N раз крупнее (меньше паттернов) |
@@ -210,6 +239,33 @@ Python-утилиты для конвертации музыки из видео
 | `--norm-scale X` | масштаб громкости XM (меньше = громче) |
 
 Полный список: `python3 <скрипт> --help`.
+
+## Проект LMMS (.mmpz)
+`--mmpz` добавляет к любому конвертеру файл `NAME.mmpz` (LMMS 1.2+). Он собирается из XM общим модулем `mmpz_export.py` (нужен только numpy, для создания файла LMMS не нужен):
+
+* каждый инструмент XM становится инструментом *AudioFileProcessor*; одновременно звучащие ноты одного инструмента раскладываются по нескольким дорожкам;
+* сэмплы пишутся рядом с проектом в `NAME_samples/*.wav` (44,1 кГц, заранее приведены к высоте так, что ключ C4 в LMMS = C-4 в XM, `relative note` и `finetune` учтены) и подключаются по абсолютному пути, поэтому проект переносите вместе с этой папкой;
+  `--mmpz-embed` кладёт их внутрь `.mmpz` (один файл), но LMMS 1.2.2 теряет встроенные сэмплы при экспорте через `lmms -r` (в самой программе не проверялось);
+* петли сохраняются; длина петли округляется до целых кадров, остаток компенсируется параметром *Pitch* дорожки, поэтому зацикленные «чиповые» волны остаются в строе;
+* громкость (колонка громкости, `Cxx`) и панорама (`8xx`) превращаются в автоматизацию дорожки; плавные смены высоты (`3xx`) - в автоматизацию *detuning* внутри одной ноты (без новой атаки);
+* темп проекта подбирается так, чтобы тик LMMS был заметно короче строки XM; позиции нот считаются по реальному времени, смены темпа XM (`Fxx`) учтены;
+* общая громкость проекта подбирается автоматически, чтобы сумма не клиппила (`mmpz_export.py --gain N` - задать вручную).
+
+**`xm2mmpz.py`** конвертирует любой готовый `.xm` (в том числе не из этих инструментов): `python3 xm2mmpz.py song.xm` -> `song.mmpz`; `--mmp` пишет несжатый `.mmp`, `--embed` встраивает сэмплы, `-d КАТАЛОГ` / `-o ФАЙЛ` задают вывод, можно сразу несколько файлов, `--bpm`/`--gain` заменяют автоматические значения. `python3 tests/mmpz_selftest.py` проверяет высоту, петли, изгибы и громкость на синтетическом модуле (рендерит через `lmms`, если он установлен).
+Ограничения: в LMMS 1.2 нет огибающей громкости отдельной ноты, поэтому изменения громкости внутри ноты идут через автоматизацию дорожки; темп не экспортируется автоматизацией.
+
+## Общие писатели
+Все конвертеры пишут файлы через три общих модуля (копий в каждом скрипте больше нет):
+
+| Модуль | Назначение |
+|---|---|
+| `xm_export.py` | запись XM: `Cell`, `XmSample`/`XmInstrument`, `grid_to_patterns`, `write_xm`, `XMWriter` |
+| `midi_export.py` | запись Standard MIDI File: `write_smf`, `write_midi`, `vlq`, события темпа/текста, таблицы GM |
+| `mmpz_export.py` | проект LMMS из XM (см. выше) |
+
+Самопроверки: `python3 tests/xm_midi_selftest.py` (запись и чтение XM/MIDI), `python3 tests/mmpz_selftest.py` (проект LMMS).
+Бесшовные петли: `xm_export.smooth_loop()` вызывается при записи XM любым конвертером (и при чтении XM в `mmpz_export.py`). Если скачок с конца петли на её начало заметно хуже самого резкого места внутри петли (из-за этого длинная нота «трещит» на стыке), подбирается близкая пара начало/конец, у которой 32 кадра перед ними лучше всего совпадают, и волна продолжается плавно; сами данные не меняются, двигаются только точки петли (конец - только к началу). Нормальные петли (чистые периоды, острые края «пилы», однопериодные волны чипов) не затрагиваются. Отключить: переменная окружения `XM_LOOP_FIX=0`.
+Название модуля в XM дополняется пробелами (скрипты PSG/PT3/SID раньше дополняли его нулевыми байтами); остальные байты файлов не изменились.
 
 ## SPC (SNES) -> XM / MIDI / WAV
 `spc_tracer/spctrace` = [Game Music Emu](https://github.com/libgme/game-music-emu) + небольшой патч в S-DSP: пишет каждый старт голоса

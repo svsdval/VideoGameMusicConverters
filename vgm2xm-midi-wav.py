@@ -38,6 +38,9 @@ import wave
 
 import numpy as np
 
+from midi_export import DRUM_NOTES, write_midi
+from xm_export import ENV_FLAT_FADEOUT, Cell, XMWriter, XmInstrument, XmSample
+
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 RENDER_DIR = os.path.join(HERE, 'vgm_render')
@@ -926,13 +929,6 @@ def interval_to_bpm_speed(delta):
     return best[1], best[2], best[3]
 
 
-class Cell:
-    __slots__ = ('note', 'inst', 'vol', 'eff', 'par')
-
-    def __init__(self):
-        self.note = self.inst = self.vol = self.eff = self.par = 0
-
-
 def allocate_channels(notes, max_channels):
     busy_until = []
     last_inst = []
@@ -967,141 +963,6 @@ def allocate_channels(notes, max_channels):
 # ═══════════════════════════════════════════════════════════════
 # XM / MIDI
 # ═══════════════════════════════════════════════════════════════
-
-class XMWriter:
-    def __init__(self, title, nch, bpm, speed):
-        self.title, self.nch, self.bpm, self.speed = title, nch, bpm, speed
-        self.patterns = []
-        self.instruments = []
-
-    def set_rows(self, grid, nrows):
-        rpp = 64
-        npat = max(1, (nrows + rpp - 1) // rpp)
-        if npat > 256:
-            print(f"[xm] ВНИМАНИЕ: {npat} паттернов > 256, хвост обрезан (используйте --compact)",
-                  file=sys.stderr)
-            npat = 256
-        self.patterns = []
-        for p in range(npat):
-            self.patterns.append([[grid.get((p * rpp + r, c)) for c in range(self.nch)]
-                                  for r in range(rpp)])
-
-    def write(self, path):
-        with open(path, 'wb') as f:
-            f.write(b'Extended Module: ')
-            f.write(self.title.encode('ascii', 'replace')[:20].ljust(20, b' '))
-            f.write(b'\x1a')
-            f.write(b'VGM2XM Converter    ')
-            f.write(struct.pack('<H', 0x0104))
-            f.write(struct.pack('<I', 276))
-            f.write(struct.pack('<HHHHHHHH', len(self.patterns), 0, self.nch,
-                                len(self.patterns), len(self.instruments), 1,
-                                self.speed, self.bpm))
-            order = bytearray(256)
-            for i in range(len(self.patterns)):
-                order[i] = i
-            f.write(order)
-            for pat in self.patterns:
-                self._write_pattern(f, pat)
-            for inst in self.instruments:
-                self._write_instrument(f, inst)
-
-    def _write_pattern(self, f, pat):
-        packed = bytearray()
-        for row in pat:
-            for c in row:
-                if c is None or not (c.note or c.inst or c.vol or c.eff or c.par):
-                    packed.append(0x80)
-                    continue
-                flag = 0x80
-                if c.note: flag |= 1
-                if c.inst: flag |= 2
-                if c.vol: flag |= 4
-                if c.eff: flag |= 8
-                if c.par: flag |= 16
-                packed.append(flag)
-                if c.note: packed.append(c.note)
-                if c.inst: packed.append(c.inst)
-                if c.vol: packed.append(c.vol)
-                if c.eff: packed.append(c.eff)
-                if c.par: packed.append(c.par)
-        f.write(struct.pack('<IBHH', 9, 0, len(pat), len(packed)))
-        f.write(packed)
-
-    def _write_instrument(self, f, inst):
-        name = inst['name'].encode('ascii', 'replace')[:22].ljust(22, b'\x00')
-        smps = inst['samples']
-        ihs = 263
-        f.write(struct.pack('<I', ihs))
-        f.write(name)
-        f.write(struct.pack('<BH', 0, len(smps)))
-        if not smps:
-            return
-        f.write(struct.pack('<I', 40))
-        km = bytearray(96)
-        for i, s in enumerate(inst['keymap'][:96]):
-            km[i] = s
-        f.write(km)
-        ve = bytearray(48)
-        struct.pack_into('<HHHH', ve, 0, 0, 64, 1000, 64)
-        f.write(ve)
-        pe = bytearray(48)
-        struct.pack_into('<HHHH', pe, 0, 0, 32, 1000, 32)
-        f.write(pe)
-        # 2 точки огибающей громкости (плоская, нужна, чтобы работал fadeout)
-        f.write(bytes([2, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0]))
-        f.write(struct.pack('<H', int(inst.get('fadeout', 0))))
-        f.write(b'\x00' * (ihs - (4 + 22 + 1 + 2 + 4 + 96 + 48 + 48 + 14 + 2)))
-        for s in smps:
-            data = s['data']
-            loop = s['loop']
-            ls, ll = loop if loop else (0, 0)
-            f.write(struct.pack('<III', len(data) * 2, ls * 2, ll * 2))
-            f.write(struct.pack('<BbBBb', 64, s['finetune'], (1 if loop else 0) | 0x10, 128, s['rel']))
-            f.write(b'\x00')
-            f.write(name)
-        for s in smps:
-            d = np.diff(s['data'].astype(np.int32), prepend=0)
-            d = ((d + 32768) % 65536 - 32768).astype('<i2')
-            f.write(d.tobytes())
-
-
-def vlq(v):
-    v = max(0, int(v))
-    out = [v & 0x7F]
-    v >>= 7
-    while v:
-        out.append((v & 0x7F) | 0x80)
-        v >>= 7
-    return bytes(reversed(out))
-
-
-DRUM_NOTES = [36, 38, 41, 43, 45, 42, 46, 49, 51, 39, 37, 56]
-
-
-def write_midi(path, title, midi_events):
-    tpqn = 480
-    tracks = collections.defaultdict(list)
-    for tick, order, ch, data in midi_events:
-        tracks[ch].append((tick, order, data))
-    out = bytearray()
-    tempo = [(0, 0, bytes([0xFF, 0x51, 0x03]) + (500000).to_bytes(3, 'big'))]
-    if title:
-        t = title.encode('ascii', 'replace')[:100]
-        tempo.append((0, 1, bytes([0xFF, 0x03, len(t)]) + t))
-    all_tracks = [tempo] + [tracks[c] for c in sorted(tracks)]
-    out += b'MThd' + struct.pack('>IHHH', 6, 1, len(all_tracks), tpqn)
-    for tr in all_tracks:
-        tr = sorted(tr, key=lambda e: (e[0], e[1]))
-        body = bytearray()
-        prev = 0
-        for tick, _, data in tr:
-            body += vlq(tick - prev) + data
-            prev = tick
-        body += vlq(0) + b'\xFF\x2F\x00'
-        out += b'MTrk' + struct.pack('>I', len(body)) + body
-    with open(path, 'wb') as f:
-        f.write(out)
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -1159,6 +1020,9 @@ def convert(args):
     base = os.path.splitext(args.output or in_path)[0]
     only = args.midi_only or args.wav_only
     want_xm = args.xm or args.all or not only
+    xm_keep = want_xm
+    want_mmpz = args.mmpz or args.all
+    want_xm = want_xm or want_mmpz
     want_midi = args.midi or args.all or args.midi_only
     want_wav = args.wav or args.all or args.wav_only
 
@@ -1491,8 +1355,11 @@ def convert(args):
                 zz = ins.zone_for(n_real)
                 keymap[cell - 1] = ins.zones.index(zz)
         nm = f"{ins.index:02d} {names[ins.kind]}"
-        xm_insts.append({'name': nm, 'samples': smps, 'keymap': keymap, 'fadeout': ins.fadeout})
-    n_samples = sum(len(x['samples']) for x in xm_insts)
+        xm_insts.append(XmInstrument(
+            nm, [XmSample(s['data'], nm, *(s['loop'] or (0, 0)), finetune=s['finetune'], relative_note=s['rel'])
+                 for s in smps],
+            keymap, fadeout=ins.fadeout, env_flags=ENV_FLAT_FADEOUT, env_x=1000))
+    n_samples = sum(len(x.samples) for x in xm_insts)
     print(f"[xm] инструментов: {len(xm_insts)}, сэмплов: {n_samples}")
 
     nch = allocate_channels(notes, args.channels)
@@ -1593,13 +1460,16 @@ def convert(args):
                 if not c.eff:
                     c.eff, c.par = 0x0F, b
                     break
-        xm = XMWriter(title, nch, start_bpm, speed)
+        xm = XMWriter(title, nch, start_bpm, speed, tracker='VGM2XM Converter')
         xm.set_rows(grid, last_row + 2)
         xm.instruments = xm_insts
         xm_path = base + '.xm'
         xm.write(xm_path)
         size = os.path.getsize(xm_path) / 1024.0
         print(f"[xm] {xm_path}  ({len(xm.patterns)} паттернов, {size:.0f} КБ)")
+        if want_mmpz:
+            import mmpz_export
+            mmpz_export.export_after_xm(xm_path, embed=args.mmpz_embed, keep_xm=xm_keep)
 
     # ── MIDI ──
     if want_midi:
@@ -1686,7 +1556,10 @@ def main():
     ap.add_argument('--wav', action='store_true', help='+ WAV (рендер libvgm, 44.1 кГц стерео)')
     ap.add_argument('--wav-only', action='store_true', help='только WAV')
     ap.add_argument('--wav-file', help='имя WAV файла')
-    ap.add_argument('--all', action='store_true', help='XM + MIDI + WAV')
+    ap.add_argument('--mmpz', action='store_true', help='XM + проект LMMS (.mmpz)')
+    ap.add_argument('--mmpz-embed', action='store_true',
+                    help='встроить сэмплы в .mmpz (по умолчанию WAV в <имя>_samples/)')
+    ap.add_argument('--all', action='store_true', help='XM + MIDI + WAV + LMMS')
     ap.add_argument('--loops', type=int, default=1, help='сколько раз проиграть петлю (1 = как в файле)')
     ap.add_argument('--octave', type=int, default=0, help='сдвиг имён нот в октавах (звук не меняется)')
     ap.add_argument('--transpose', type=int, default=0, help='сдвиг имён нот в полутонах (звук не меняется)')
