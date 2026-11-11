@@ -16,10 +16,12 @@
 #include <tuple>
 #include <vector>
 
+#include "../audacious_common/xmloop.hpp"
+
 namespace usfexp {
 
 constexpr double C4_HZ = 261.6256, XM_C4_RATE = 8363.0;
-constexpr int MAX_XM_CHANNELS = 32, MAX_XM_INSTRUMENTS = 128;
+constexpr int MAX_XM_CHANNELS = 32, MAX_XM_INSTRUMENTS = 128, MAX_XM_SAMPLES_PER_INST = 16;
 static const int DRUM_NOTES[12] = {36, 38, 41, 43, 45, 42, 46, 49, 51, 39, 37, 56};
 static const int GM_PROGRAMS[24] = {0, 25, 33, 48, 80, 81, 73, 56, 4, 11, 19, 24, 38, 46, 52, 61,
                                     71, 65, 87, 90, 95, 98, 104, 108};
@@ -374,6 +376,10 @@ struct Sample
     double period = 0, confidence = 0, m1 = 0, centroid = 0, peak = 1.0, tune = 0;
     bool pitched = false;
     int fold = 0;
+    int shift = 0;                  // сдвиг нот в полутонах (кратен 12 при обычной раскладке); tune его компенсирует
+    int inst = 0, sub = 0;          // инструмент XM и номер сэмпла в нём
+    int win_a = 0, win_w = 0, cw = 0;   // окно keymap при упаковке (первая нота, ширина)
+    double lo = 0, hi = 0;          // диапазон нот сэмпла до сдвига
     Sample(uint32_t h, std::vector<int16_t> d) : hash(h), data(std::move(d)) {}
 
     void analyse()
@@ -635,6 +641,67 @@ inline void vlq(Buf & b, int v)
     b.raw(r);
 }
 
+// Раскладка при >128 сэмплах (порт pack_samples из usf2xm-midi-wav.py): до 16 сэмплов в инструменте XM,
+// каждому окно нот шириной в диапазон его высот; сдвиг нот компенсируется relative note.
+inline std::vector<std::vector<Sample *>> pack_samples(const std::vector<Sample *> & samples, double ref, int total_shift)
+{
+    std::vector<Sample *> order = samples;
+    std::stable_sort(order.begin(), order.end(), [](Sample * a, Sample * b) {
+        int la = (int)std::nearbyint(a->lo), lb = (int)std::nearbyint(b->lo);
+        return la != lb ? la < lb : a->index < b->index;
+    });
+    std::vector<std::vector<Sample *>> groups;
+    std::vector<Sample *> cur, standalone;
+    int width = 0;
+    for (Sample * s : order)
+    {
+        int w = std::max(1, (int)std::nearbyint(s->hi) - (int)std::nearbyint(s->lo) + 1);
+        if (w > 48) { standalone.push_back(s); continue; }
+        s->cw = w;
+        if (!cur.empty() && ((int)cur.size() >= MAX_XM_SAMPLES_PER_INST || width + w > 96))
+        {
+            groups.push_back(cur);
+            cur.clear();
+            width = 0;
+        }
+        cur.push_back(s);
+        width += w;
+    }
+    if (!cur.empty()) groups.push_back(cur);
+    const double base = 12.0 * std::log2(ref / XM_C4_RATE) - total_shift;
+    std::vector<std::vector<Sample *>> fin;
+    for (auto & g : groups)
+    {
+        int a = 1;
+        std::vector<Sample *> ok;
+        for (Sample * s : g)
+        {
+            int shift = (int)std::nearbyint(s->lo) - a;
+            double tune = base - s->m1 + shift;
+            int rt = (int)std::nearbyint(tune);
+            if (rt >= -96 && rt <= 95)
+            {
+                s->shift = shift; s->tune = tune; s->win_a = a; s->win_w = s->cw;
+                a += s->cw;
+                ok.push_back(s);
+            }
+            else standalone.push_back(s);
+        }
+        if (!ok.empty()) fin.push_back(ok);
+    }
+    for (Sample * s : standalone) { s->win_a = s->win_w = 0; fin.push_back({s}); }
+    auto first = [](const std::vector<Sample *> & g) {
+        int m = g[0]->index;
+        for (Sample * s : g) m = std::min(m, s->index);
+        return m;
+    };
+    std::stable_sort(fin.begin(), fin.end(), [&](const std::vector<Sample *> & x, const std::vector<Sample *> & y) {
+        return first(x) < first(y);
+    });
+    if ((int)fin.size() > MAX_XM_INSTRUMENTS) fin.resize(MAX_XM_INSTRUMENTS);
+    return fin;
+}
+
 inline double cell_float(const Note & n, int idx, const Sample & s, double shift)
 {
     double r = std::max(n.ratio[idx], 1e-4);
@@ -668,7 +735,9 @@ inline std::string convert(const Trace & tr, const std::vector<int16_t> & pcm, c
     }
     std::vector<uint32_t> used = seen_order;
     std::stable_sort(used.begin(), used.end(), [&](uint32_t a, uint32_t b) { return cnt[a] > cnt[b]; });
-    if ((int)used.size() > MAX_XM_INSTRUMENTS) used.resize(MAX_XM_INSTRUMENTS);
+    const bool pack = (int)used.size() > MAX_XM_INSTRUMENTS;      // больше 128 сэмплов: упаковываем в инструменты
+    if (pack && (int)used.size() > MAX_XM_INSTRUMENTS * MAX_XM_SAMPLES_PER_INST)
+        used.resize(MAX_XM_INSTRUMENTS * MAX_XM_SAMPLES_PER_INST);
     std::stable_sort(used.begin(), used.end(), [&](uint32_t a, uint32_t b) { return first[a] < first[b]; });
     std::map<uint32_t, std::unique_ptr<Sample>> samples;
     std::vector<Sample *> sample_list;
@@ -721,7 +790,33 @@ inline std::string convert(const Trace & tr, const std::vector<int16_t> & pcm, c
             fold = (int)std::nearbyint((mid - 48.5) / 12.0);
         }
         s->fold = fold;
-        s->tune = 12.0 * std::log2(rate / XM_C4_RATE) - s->m1 - total_shift + 12 * fold;
+        s->shift = 12 * fold;
+        s->lo = lo; s->hi = hi;
+        s->tune = 12.0 * std::log2(rate / XM_C4_RATE) - s->m1 - total_shift + s->shift;
+    }
+
+    // раскладка сэмплов по инструментам XM
+    std::vector<std::vector<Sample *>> groups;
+    if (pack) groups = pack_samples(sample_list, rate, total_shift);
+    else for (Sample * s : sample_list) groups.push_back({s});
+    {
+        std::set<Sample *> kept;
+        for (size_t gi = 0; gi < groups.size(); gi++)
+            for (size_t si = 0; si < groups[gi].size(); si++)
+            {
+                groups[gi][si]->inst = (int)gi + 1;
+                groups[gi][si]->sub = (int)si;
+                kept.insert(groups[gi][si]);
+            }
+        if (kept.size() != sample_list.size())          // не поместились в 128 инструментов
+        {
+            std::vector<Sample *> sl;
+            for (Sample * s : sample_list) if (kept.count(s)) sl.push_back(s);
+            sample_list = sl;
+            std::vector<Note *> nn;
+            for (Note * n : notes) if (kept.count(n->sample)) nn.push_back(n);
+            notes = nn;
+        }
     }
 
     // громкость: 98-й перцентиль пиков
@@ -788,12 +883,12 @@ inline std::string convert(const Trace & tr, const std::vector<int16_t> & pcm, c
                     int fr = (int)(std::lower_bound(frame_times.begin(), frame_times.end(), t) - frame_times.begin());
                     return std::max(0, std::min((int)n->frames.size() - 1, fr - n->start_frame));
                 };
-                double cshift = total_shift - 12 * s.fold;
+                double cshift = total_shift - s.shift;
                 double f0 = cell_float(*n, 0, s, cshift);
                 int cur_cell = std::max(1, std::min(96, (int)std::nearbyint(f0)));
                 Cell & c0 = put(n->start_row);
                 c0.note = cur_cell;
-                c0.inst = s.index;
+                c0.inst = s.inst;
                 int ci = 0;
                 for (size_t i = 0; i < n->level.size(); i++) if (n->level[i] >= 0.5 * n->peak) { ci = (int)i; break; }
                 int last_vol = vol_at(idx_at(n->start_row));
@@ -849,7 +944,7 @@ inline std::string convert(const Trace & tr, const std::vector<int16_t> & pcm, c
         b.u8(0x1a);
         b.str("USF2XM Converter    ", 20, ' ');
         b.le16(0x0104); b.le32(276);
-        b.le16(npat); b.le16(0); b.le16(nch); b.le16(npat); b.le16((int)sample_list.size()); b.le16(1);
+        b.le16(npat); b.le16(0); b.le16(nch); b.le16(npat); b.le16((int)groups.size()); b.le16(1);
         b.le16(speed); b.le16(start_bpm);
         for (int i = 0; i < 256; i++) b.u8(i < npat ? i : 0);
         for (int p = 0; p < npat; p++)
@@ -876,36 +971,57 @@ inline std::string convert(const Trace & tr, const std::vector<int16_t> & pcm, c
                 }
             b.le32(9); b.u8(0); b.le16(rpp); b.le16((int)pk.d.size()); b.raw(pk.d);
         }
-        for (Sample * s : sample_list)
+        for (auto & g : groups)
         {
-            std::vector<int16_t> data;
-            for (int16_t v : s->data)
-                data.push_back((int16_t)std::max(-32768.0, std::min(32767.0, std::nearbyint(v * (32767.0 / s->peak)))));
-            int rel = std::max(-96, std::min(95, (int)std::nearbyint(s->tune)));
-            int fine = std::max(-128, std::min(127, (int)std::nearbyint((s->tune - rel) * 128)));
-            char nm[40];
-            snprintf(nm, sizeof nm, "S%02d %08x", s->index, s->hash);
-            std::string name = nm;
+            struct XS { std::vector<int16_t> data; std::string name; int ls, ll, rel, fine; bool loop; };
+            std::vector<XS> xs;
+            for (Sample * s : g)
+            {
+                XS x;
+                for (int16_t v : s->data)
+                    x.data.push_back((int16_t)std::max(-32768.0, std::min(32767.0, std::nearbyint(v * (32767.0 / s->peak)))));
+                x.rel = std::max(-96, std::min(95, (int)std::nearbyint(s->tune)));
+                x.fine = std::max(-128, std::min(127, (int)std::nearbyint((s->tune - x.rel) * 128)));
+                char nm[40];
+                snprintf(nm, sizeof nm, "S%02d %08x", s->index, s->hash);
+                x.name = nm;
+                x.ls = s->loop.has ? s->loop.start : 0;
+                x.ll = s->loop.has ? s->loop.len : 0;
+                x.loop = s->loop.has;
+                xmloop::fix_loop(x.data, x.ls, x.ll, x.loop);     // бесшовная петля (как xm_export.smooth_loop)
+                xs.push_back(std::move(x));
+            }
+            std::string iname = xs[0].name;
+            if (xs.size() > 1) { char gn[32]; snprintf(gn, sizeof gn, "G%02d x%d", g[0]->inst, (int)xs.size()); iname = gn; }
+            uint8_t km[96] = {0};
+            if (xs.size() > 1)
+                for (Sample * s : g)
+                    for (int c = s->win_a; c < s->win_a + s->win_w && c <= 96; c++) km[c - 1] = (uint8_t)s->sub;
             const int ihs = 263;
-            b.le32(ihs); b.str(name, 22, 0);
-            b.u8(0); b.le16(1); b.le32(40);
-            for (int i = 0; i < 96; i++) b.u8(0);
+            b.le32(ihs); b.str(iname, 22, 0);
+            b.u8(0); b.le16((int)xs.size()); b.le32(40);
+            for (int i = 0; i < 96; i++) b.u8(km[i]);
             { uint8_t ve[48] = {0}; ve[2] = 64; ve[4] = 100; ve[6] = 64; b.raw({ve, ve + 48}); }
             { uint8_t pe[48] = {0}; pe[2] = 32; pe[4] = 100; pe[6] = 32; b.raw({pe, pe + 48}); }
             b.raw({2, 2, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0});
             b.le16(0);
             for (int i = 0; i < ihs - (4 + 22 + 1 + 2 + 4 + 96 + 48 + 48 + 14 + 2); i++) b.u8(0);
-            int ls = s->loop.has ? s->loop.start : 0, ll = s->loop.has ? s->loop.len : 0;
-            b.le32((uint32_t)data.size() * 2); b.le32(ls * 2); b.le32(ll * 2);
-            b.u8(64); b.u8((uint8_t)(int8_t)fine); b.u8((s->loop.has ? 1 : 0) | 0x10); b.u8(128); b.u8((uint8_t)(int8_t)rel);
-            b.u8(0);
-            b.str(name, 22, 0);
-            int prev = 0;
-            for (int16_t v : data)
+            for (auto & x : xs)
             {
-                int d = (((int)v - prev + 32768) % 65536 + 65536) % 65536 - 32768;
-                b.le16(d & 0xFFFF);
-                prev = v;
+                b.le32((uint32_t)x.data.size() * 2); b.le32(x.ls * 2); b.le32(x.ll * 2);
+                b.u8(64); b.u8((uint8_t)(int8_t)x.fine); b.u8((x.loop ? 1 : 0) | 0x10); b.u8(128); b.u8((uint8_t)(int8_t)x.rel);
+                b.u8(0);
+                b.str(x.name, 22, 0);
+            }
+            for (auto & x : xs)
+            {
+                int prev = 0;
+                for (int16_t v : x.data)
+                {
+                    int d = (((int)v - prev + 32768) % 65536 + 65536) % 65536 - 32768;
+                    b.le16(d & 0xFFFF);
+                    prev = v;
+                }
             }
         }
         if (!b.save(base + ".xm")) return "cannot write " + base + ".xm";

@@ -678,6 +678,8 @@ inline std::string convert(const spcemu::Trace & tr, const uint8_t * ram, const 
             if (s->hash == NOISE_HASH) snprintf(nm, sizeof nm, "S%02d -0000001", s->orig);
             else snprintf(nm, sizeof nm, "S%02d %08x", s->orig, s->hash);
             std::string name = nm;
+            int ls = s->loop.has ? s->loop.start : 0, ll = s->loop.has ? s->loop.len : 0;
+            xmloop::fix_loop(data, ls, ll, s->loop.has);         // бесшовная петля (как xm_export.smooth_loop)
             const int ihs = 263;
             b.le32(ihs); b.str(name, 22, 0);
             b.u8(0); b.le16(1); b.le32(40);
@@ -687,7 +689,6 @@ inline std::string convert(const spcemu::Trace & tr, const uint8_t * ram, const 
             b.raw({2, 2, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0});
             b.le16(0);
             for (int i = 0; i < ihs - (4 + 22 + 1 + 2 + 4 + 96 + 48 + 48 + 14 + 2); i++) b.u8(0);
-            int ls = s->loop.has ? s->loop.start : 0, ll = s->loop.has ? s->loop.len : 0;
             b.le32((uint32_t)data.size() * 2); b.le32(ls * 2); b.le32(ll * 2);
             b.u8(64); b.u8((uint8_t)(int8_t)fine); b.u8((s->loop.has ? 1 : 0) | 0x10); b.u8(128); b.u8((uint8_t)(int8_t)rel);
             b.u8(0);

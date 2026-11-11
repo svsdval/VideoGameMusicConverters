@@ -28,13 +28,14 @@
     WidgetLabel(N_("<b>Export to XM / MIDI</b> (playlist menu: right click on tracks)")), \
     WidgetCheck(N_("Write XM (tracker module)"), WidgetBool(SEC, "exp_xm")), \
     WidgetCheck(N_("Write MIDI"), WidgetBool(SEC, "exp_midi")), \
+    WidgetCheck(N_("Write LMMS project (.mmpz, uses xm2mmpz.py from the scripts folder)"), WidgetBool(SEC, "exp_lmms")), \
     WidgetSpin(N_("Emulate seconds (0 = automatic):"), WidgetInt(SEC, "exp_seconds"), {0, 3600, 10, N_("s")}), \
     WidgetEntry(N_("Output folder (empty = next to the source):"), WidgetString(SEC, "exp_dir")), \
     WidgetEntry(N_("Converter scripts folder:"), WidgetString(SEC, "exp_scripts")), \
     WidgetEntry(N_("Python command:"), WidgetString(SEC, "exp_python"))
 
 #define EXPORT_DEFAULTS \
-    "exp_xm", "TRUE", "exp_midi", "TRUE", "exp_seconds", "0", "exp_dir", "", \
+    "exp_xm", "TRUE", "exp_midi", "TRUE", "exp_lmms", "FALSE", "exp_seconds", "0", "exp_dir", "", \
     "exp_python", "python3", "exp_scripts", EXPORT_SCRIPT_DIR
 
 namespace exporter {
@@ -112,17 +113,27 @@ inline void export_selected(const Info & inf)
 {
     bool want_xm = aud_get_bool(inf.section, "exp_xm");
     bool want_midi = aud_get_bool(inf.section, "exp_midi");
-    if (!want_xm && !want_midi)
+    const bool want_lmms = aud_get_bool(inf.section, "exp_lmms");
+    if (!want_xm && !want_midi && !want_lmms)
     {
-        aud_ui_show_error(_("Export: enable XM and/or MIDI in the plugin settings."));
+        aud_ui_show_error(_("Export: enable XM, MIDI and/or LMMS project in the plugin settings."));
         return;
     }
+    // проект LMMS собирается из XM: если XM не нужен сам по себе, он пишется как промежуточный файл и удаляется
+    const bool gen_xm = want_xm || want_lmms;
     std::string python = (const char *)aud_get_str(inf.section, "exp_python");
     std::string scripts = (const char *)aud_get_str(inf.section, "exp_scripts");
     std::string outdir = (const char *)aud_get_str(inf.section, "exp_dir");
     int secs = aud_get_int(inf.section, "exp_seconds");
     if (python.empty()) python = "python3";
     std::string script = scripts + "/" + inf.script;
+    const std::string lmms_script = scripts + "/xm2mmpz.py";
+    if (want_lmms && access(lmms_script.c_str(), R_OK))
+    {
+        aud_ui_show_error(str_printf(_("LMMS export needs %s (set the scripts folder in the plugin settings)."),
+                                     lmms_script.c_str()));
+        return;
+    }
     const bool builtin_on = inf.builtin && aud_get_bool(inf.section, "exp_builtin");
     if (!builtin_on && access(script.c_str(), R_OK))
     {
@@ -165,12 +176,28 @@ inline void export_selected(const Info & inf)
     std::thread([=]() {
         int ok = 0;
         std::string errors;
+        // после XM: собрать проект LMMS (xm2mmpz.py), промежуточный XM удалить; "" или текст ошибки
+        auto post = [&](const Job & j, bool xm_existed) -> std::string {
+            if (!want_lmms) return "";
+            std::string o;
+            int rc = run({python, lmms_script, j.out_base + ".xm", "-o", j.out_base + ".mmpz"}, o);
+            if (!want_xm && !xm_existed) unlink((j.out_base + ".xm").c_str());   // XM был только промежуточным
+            if (rc == 0) return "";
+            return "LMMS: " + (rc == 127 ? "cannot run " + python : o.substr(o.size() > 600 ? o.size() - 600 : 0));
+        };
         for (const Job & j : jobs)
         {
+            const bool xm_existed = access((j.out_base + ".xm").c_str(), F_OK) == 0;
             if (use_builtin)
             {
-                std::string err = inf.builtin(j, want_xm, want_midi);
-                if (err.empty()) { ok++; continue; }
+                std::string err = inf.builtin(j, gen_xm, want_midi);
+                if (err.empty())
+                {
+                    err = post(j, xm_existed);
+                    if (err.empty()) ok++;
+                    else errors += j.input + ": " + err + "\n";
+                    continue;
+                }
                 // "unsupported: ..." - встроенный конвертер не умеет этот файл, но скрипт может (USF ABI2/ABI3)
                 if (err.rfind("unsupported:", 0) != 0 || access(script.c_str(), R_OK))
                 {
@@ -185,23 +212,28 @@ inline void export_selected(const Info & inf)
                 a.push_back(j.out_base + ".xm");
                 if (want_midi)
                 {
-                    a.push_back(want_xm ? "--midi" : "--midi-only");
+                    a.push_back(gen_xm ? "--midi" : "--midi-only");
                     a.push_back("--midi-file");
                     a.push_back(j.out_base + ".mid");
                 }
-                else if (!want_xm) continue;
+                else if (!gen_xm) continue;
             }
             else
             {
                 a.push_back("-o");
                 a.push_back(j.out_base);
-                if (want_midi) a.push_back(want_xm ? "--midi" : "--midi-only");
+                if (want_midi) a.push_back(gen_xm ? "--midi" : "--midi-only");
             }
             if (inf.sub_opt && j.sub > 0) { a.push_back(inf.sub_opt); a.push_back(std::to_string(j.sub)); }
             if (secs > 0) { a.push_back("--seconds"); a.push_back(std::to_string(secs)); }
             std::string out;
             int rc = run(a, out);
-            if (rc == 0) ok++;
+            if (rc == 0)
+            {
+                std::string err = post(j, xm_existed);
+                if (err.empty()) ok++;
+                else errors += j.input + ": " + err + "\n";
+            }
             else errors += j.input + ": " + (rc == 127 ? "cannot run " + python : out.substr(out.size() > 600 ? out.size() - 600 : 0)) + "\n";
         }
         if (!errors.empty()) aud_ui_show_error(str_printf("Export errors:\n%s", errors.c_str()));

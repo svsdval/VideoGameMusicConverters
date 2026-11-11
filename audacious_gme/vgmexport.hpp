@@ -18,6 +18,8 @@
 
 #include <zlib.h>
 
+#include "../audacious_common/xmloop.hpp"
+
 namespace vgmexp {
 
 constexpr int SR = 44100, SETTLE = 300, MAX_XM_CHANNELS = 32, MAX_XM_INSTRUMENTS = 128;
@@ -1677,6 +1679,7 @@ inline std::string convert(const VGM & v, const std::string & base, const std::s
         }
         for (auto & xi : xm_insts)
         {
+            for (auto & s : xi.samples) xmloop::fix_loop(s.data, s.ls, s.ll, s.loop);   // бесшовные петли
             const int ihs = 263;
             b.le32(ihs); b.str(xi.name, 22, 0);
             b.u8(0); b.le16((int)xi.samples.size());

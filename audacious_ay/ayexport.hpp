@@ -10,6 +10,7 @@
 #include <string>
 #include <vector>
 
+#include "../audacious_common/xmloop.hpp"
 #include "ay.hpp"
 
 namespace ayexp {
@@ -245,9 +246,9 @@ struct Buf
     void le32(uint32_t v) { le16(v & 0xFFFF); le16(v >> 16); }
     void be16(int v) { u8((v >> 8) & 0xFF); u8(v & 0xFF); }
     void be32(uint32_t v) { be16(v >> 16); be16(v & 0xFFFF); }
-    void str(const std::string & s, size_t n)
+    void str(const std::string & s, size_t n, char pad = 0)
     {
-        for (size_t i = 0; i < n; i++) u8(i < s.size() ? ((unsigned char)s[i] < 128 ? s[i] : '?') : 0);
+        for (size_t i = 0; i < n; i++) u8(i < s.size() ? ((unsigned char)s[i] < 128 ? s[i] : '?') : pad);
     }
     void zeros(size_t n) { d.insert(d.end(), n, 0); }
     void raw(const std::vector<uint8_t> & v) { d.insert(d.end(), v.begin(), v.end()); }
@@ -307,7 +308,7 @@ inline bool write_xm(const std::string & fn, const std::vector<NoteEvent> & even
 
     Buf b;
     b.str("Extended Module: ", 17);
-    b.str(title, 20);
+    b.str(title, 20, ' ');
     b.u8(0x1a);
     b.str("PT32XM Converter    ", 20);
     b.le16(0x0104); b.le32(276); b.le16(np); b.le16(0); b.le16(nc); b.le16(np);
@@ -343,13 +344,16 @@ inline bool write_xm(const std::string & fn, const std::vector<NoteEvent> & even
         b.raw({2, 2, 0, 0, 1, 0, 0, 1, 0, 0, 0, 0, 0, 0});
         b.le16(0);
         b.zeros(ihs - (4 + 22 + 1 + 2 + 4 + 96 + 48 + 48 + 14 + 2));
-        uint32_t n = (uint32_t)in.data.size();
-        b.le32(n * 2); b.le32(0); b.le32(in.loop ? n * 2 : 0);
+        std::vector<int16_t> data = in.data;
+        int ls = 0, ll = in.loop ? (int)data.size() : 0;
+        xmloop::fix_loop(data, ls, ll, in.loop);               // бесшовная петля
+        uint32_t n = (uint32_t)data.size();
+        b.le32(n * 2); b.le32(ls * 2); b.le32(ll * 2);
         b.u8(64); b.u8(0); b.u8((in.loop ? 1 : 0) | 0x10); b.u8(128); b.u8((uint8_t)(int8_t)in.rel);
         b.u8(0);
         b.str(in.name, 22);
         int prev = 0;
-        for (int16_t v : in.data)
+        for (int16_t v : data)
         {
             int d = (((int)v - prev + 32768) % 65536 + 65536) % 65536 - 32768;
             b.le16(d & 0xFFFF);

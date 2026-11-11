@@ -11,6 +11,8 @@
 #include <string>
 #include <vector>
 
+#include "../audacious_common/xmloop.hpp"
+
 namespace sidexp {
 
 constexpr int PAL_CLOCK = 985248, NTSC_CLOCK = 1022727;
@@ -548,7 +550,7 @@ inline bool write_xm(const std::string & fn, const std::vector<NoteEvent> & even
     int np = std::max(1, std::min(256, (mr + rpp - 1) / rpp));
     Buf b;
     b.str("Extended Module: ", 17, 0);
-    b.str(title, 20, 0);
+    b.str(title, 20, ' ');
     b.u8(0x1a);
     b.str("SID2XM Converter    ", 20, ' ');
     b.le16(0x0104); b.le32(276); b.le16(np); b.le16(0); b.le16(nc); b.le16(np); b.le16((int)std::min<size_t>(insts.size(), 128));
@@ -583,14 +585,17 @@ inline bool write_xm(const std::string & fn, const std::vector<NoteEvent> & even
         b.raw({2, 2, 0, 0, 1, 0, 0, 1, 1, 0, 0, 0, 0, 0});
         b.le16(0x800);
         for (int i = 0; i < ihs - (4 + 22 + 1 + 2 + 4 + 96 + 48 + 48 + 14 + 2); i++) b.u8(0);
-        b.le32((uint32_t)in.data.size() * 2); b.le32(0); b.le32((uint32_t)in.loop_len * 2);
+        std::vector<int16_t> data;
+        for (int v : in.data) data.push_back((int16_t)std::max(-32768, std::min(32767, v)));
+        int ls = 0, ll = in.loop_len;
+        xmloop::fix_loop(data, ls, ll, (in.loop_type & 3) == 1);   // бесшовная петля
+        b.le32((uint32_t)data.size() * 2); b.le32(ls * 2); b.le32(ll * 2);
         b.u8(64); b.u8(0);
         b.u8((in.loop_type & 3) | 0x10); b.u8(128); b.u8(0); b.u8(0);
         b.str(in.name, 22, 0);
         int prev = 0;
-        for (int v : in.data)
+        for (int v : data)
         {
-            v = std::max(-32768, std::min(32767, v));
             int d = (((v - prev) + 32768) % 65536 + 65536) % 65536 - 32768;
             b.le16(d & 0xFFFF);
             prev = v;

@@ -123,11 +123,13 @@ def smooth_loop(data, loop_start, loop_length, ctx=LOOP_CTX):
     if len(ls_c) == 0:
         return ls, ll, False
     e_c = np.arange(max(int(ls_c[0]) + ll // 2, e0 - we), e0 + 1)
+    if len(e_c) == 0:
+        return ls, ll, False
     A = x[e_c[:, None] - ctx + np.arange(ctx)[None, :]]
     B = x[ls_c[:, None] - ctx + np.arange(ctx)[None, :]]
     D = (A ** 2).sum(1)[:, None] + (B ** 2).sum(1)[None, :] - 2.0 * (A @ B.T)
     # из лучших по совпадению окон берём ту пару, у которой ещё и сам стык гладкий
-    order = np.argsort(D, axis=None)[:64]
+    order = np.argsort(D, axis=None, kind='stable')[:64]      # D - целые числа в float64 (точные), ничьи по номеру
     best = None
     for k in order:
         i, j = np.unravel_index(k, D.shape)
