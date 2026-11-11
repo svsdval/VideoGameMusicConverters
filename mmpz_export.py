@@ -71,7 +71,9 @@ class XmModule:
         self.bpm = 125
         self.order = []
         self.patterns = []            # [паттерн][строка] -> список ячеек (note, inst, vol, eff, par)
-        self.instruments = {}         # номер (с 1) -> (имя, XmSample)
+        self.instruments = {}         # номер (с 1) -> (имя, первый XmSample)
+        self.samples = {}             # (номер инструмента, номер сэмпла в нём) -> (имя, XmSample)
+        self.keymaps = {}             # номер инструмента -> 96 номеров сэмплов по нотам
 
 
 def _unpack_pattern(raw, nrows, nch):
@@ -134,6 +136,7 @@ def read_xm(path):
             p = q
             continue
         shs = struct.unpack_from('<I', d, p + 29)[0]
+        keymap = list(d[p + 33:p + 33 + 96])
         heads = []
         for k in range(ns):
             h = d[q:q + shs]
@@ -142,6 +145,7 @@ def read_xm(path):
             heads.append((length, ls, ll, vol, fine, typ, pan, rel, h[18:40]))
             q += shs
         first = None
+        loaded = []
         for (length, ls, ll, vol, fine, typ, pan, rel, sname) in heads:
             raw = d[q:q + length]
             q += length
@@ -159,10 +163,17 @@ def read_xm(path):
                 s.loop_start, s.loop_len = ls, ll
             s.loop_type = typ & 3
             s.volume, s.finetune, s.pan, s.rel = vol, fine, pan, rel
+            loaded.append(s)
             if first is None:
                 first = s
         if first is not None and len(first.data):
             xm.instruments[i] = (name or first.name or ('S%02d' % i), first)
+            for k, smp in enumerate(loaded):
+                if len(smp.data):
+                    xm.samples[(i, k)] = ((smp.name or name or 'S%02d' % i) if len(loaded) > 1
+                                          else (name or smp.name or 'S%02d' % i), smp)
+            if len(loaded) > 1:
+                xm.keymaps[i] = keymap
         p = q
     return xm
 
@@ -215,13 +226,16 @@ def build_notes(xm):
                 elif 1 <= note <= 96:
                     cur = chan[ch]
                     ins = xm.instruments.get(last_inst[ch])
+                    key = (last_inst[ch], xm.keymaps[last_inst[ch]][note - 1] if last_inst[ch] in xm.keymaps else 0)
+                    if key not in xm.samples:
+                        ins = None
                     if porta and cur is not None:
                         if not cur.bends or cur.bends[-1][1] != note:
                             cur.bends.append((t, note))
                     elif ins is not None:
                         if cur is not None:
                             cur.t1 = t
-                        smp = ins[1]
+                        smp = xm.samples[key][1]
                         if inst:
                             chan_vol[ch] = smp.volume
                             chan_pan[ch] = smp.pan
@@ -231,7 +245,7 @@ def build_notes(xm):
                             chan_pan[ch] = par
                         if eff == 0x0C:
                             chan_vol[ch] = min(64, par)
-                        n = Note(last_inst[ch], note, t, chan_vol[ch], chan_pan[ch])
+                        n = Note(key, note, t, chan_vol[ch], chan_pan[ch])
                         chan[ch] = n
                         notes.append(n)
                         continue
@@ -440,15 +454,15 @@ def xm_to_project(xm, out_path, embed=False, bpm=None, samples_dir=None, gain=No
     # сэмплы
     used = sorted({n.inst for n in notes})
     samples = {}
-    for i in used:
-        name, smp = xm.instruments[i]
-        samples[i] = LmmsSample(i, name, smp)
+    for k, i in enumerate(used, 1):
+        name, smp = xm.samples[i]
+        samples[i] = LmmsSample(k, name, smp)
     if not embed:
         base = os.path.splitext(out_path)[0]
         samples_dir = samples_dir or (base + '_samples')
         os.makedirs(samples_dir, exist_ok=True)
         for i, s in samples.items():
-            fn = '%02d %s.wav' % (i, ''.join(ch if ch.isalnum() or ch in ' -_.' else '_' for ch in s.name)[:40].strip())
+            fn = '%02d %s.wav' % (s.inst_no, ''.join(ch if ch.isalnum() or ch in ' -_.' else '_' for ch in s.name)[:40].strip())
             s.path = os.path.abspath(os.path.join(samples_dir, fn))
             s.write_wav(s.path)
 

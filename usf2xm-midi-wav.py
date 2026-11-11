@@ -40,7 +40,7 @@ import zlib
 import numpy as np
 
 from midi_export import DRUM_NOTES, GM_PROGRAMS, write_midi  # noqa: E402,F401
-from xm_export import Cell, XMWriter, XmInstrument
+from xm_export import Cell, XMWriter, XmInstrument, XmSample
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
@@ -50,6 +50,7 @@ C4_HZ = 261.6256
 XM_C4_RATE = 8363.0
 MAX_XM_CHANNELS = 32
 MAX_XM_INSTRUMENTS = 128
+MAX_XM_SAMPLES_PER_INST = 16
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -426,6 +427,11 @@ class Sample:
         self.pitched = False
         self.centroid = 0.0
         self.fold = 0                 # сдвиг октав, чтобы ноты влезли в 1..96
+        self.shift = 0                # сдвиг нот в полутонах (кратен 12 при обычной раскладке); tune его компенсирует
+        self.inst = 0                 # номер инструмента XM (у упакованных сэмплов общий на группу)
+        self.sub = 0                  # номер сэмпла внутри инструмента
+        self.win = None               # (первая нота, ширина) окна keymap при упаковке
+        self.lo = self.hi = 0.0       # диапазон нот сэмпла (до сдвига)
         self.peak = 1.0
         self.tune = 0.0               # relative_note + finetune/128
 
@@ -580,6 +586,57 @@ def allocate_channels(notes, max_channels):
     return len(busy_until)
 
 
+def pack_samples(samples, ref, total_shift):
+    """Раскладывает сэмплы по инструментам XM, когда их больше MAX_XM_INSTRUMENTS.
+
+    В одном инструменте XM до 16 сэмплов; какой играет, решает keymap по номеру ноты. Поэтому каждому
+    сэмплу отводится окно подряд идущих нот шириной в диапазон высот его нот, а сами ноты сдвигаются
+    в это окно; сдвиг компенсируется relative note сэмпла (высота не меняется).
+    Сэмплы идут по возрастанию высоты, так что сдвиги остаются небольшими. Сэмплы, которым окно не
+    подходит (relative note вылезает за -96..95), остаются отдельными инструментами."""
+    order = sorted(samples.values(), key=lambda s: (int(round(s.lo)), s.index))
+    groups, cur, width = [], [], 0
+    standalone = []
+    for s in order:
+        w = max(1, int(round(s.hi)) - int(round(s.lo)) + 1)
+        if w > 48:
+            standalone.append(s)
+            continue
+        s.cw = w
+        if cur and (len(cur) >= MAX_XM_SAMPLES_PER_INST or width + w > 96):
+            groups.append(cur)
+            cur, width = [], 0
+        cur.append(s)
+        width += w
+    if cur:
+        groups.append(cur)
+    base = 12.0 * math.log2(ref / XM_C4_RATE) - total_shift
+    final = []
+    for g in groups:
+        a = 1
+        ok = []
+        for s in g:
+            shift = int(round(s.lo)) - a
+            tune = base - s.m1 + shift
+            if -96 <= round(tune) <= 95:
+                s.shift, s.tune, s.win = shift, tune, (a, s.cw)
+                a += s.cw
+                ok.append(s)
+            else:
+                standalone.append(s)
+        if ok:
+            final.append(ok)
+    for s in standalone:                       # прежняя раскладка: свой инструмент, сдвиг по октавам
+        s.win = None
+        final.append([s])
+    first = lambda g: min(s.index for s in g)
+    final.sort(key=first)
+    if len(final) > MAX_XM_INSTRUMENTS:
+        print(f"[xm] ВНИМАНИЕ: инструментов {len(final)} > {MAX_XM_INSTRUMENTS}, лишние отброшены", file=sys.stderr)
+        final = final[:MAX_XM_INSTRUMENTS]
+    return final
+
+
 def cell_float(note, ratio_idx, sample, shift):
     """Нота XM (вещественная) для i-го кадра ноты."""
     r = max(note.ratio[ratio_idx], 1e-4)
@@ -682,10 +739,14 @@ def convert(args):
         samples = {}
         cnt = collections.Counter(n.hash for n in notes)
         used = [h for h, _ in cnt.most_common()]
-        if len(used) > MAX_XM_INSTRUMENTS:
-            print(f"[xm] ВНИМАНИЕ: {len(used)} сэмплов > {MAX_XM_INSTRUMENTS}, "
-                  f"редкие отброшены", file=sys.stderr)
-            used = used[:MAX_XM_INSTRUMENTS]
+        pack = len(used) > MAX_XM_INSTRUMENTS
+        if pack:
+            if len(used) > MAX_XM_INSTRUMENTS * MAX_XM_SAMPLES_PER_INST:
+                print(f"[xm] ВНИМАНИЕ: {len(used)} сэмплов > {MAX_XM_INSTRUMENTS * MAX_XM_SAMPLES_PER_INST}, "
+                      f"редкие отброшены", file=sys.stderr)
+                used = used[:MAX_XM_INSTRUMENTS * MAX_XM_SAMPLES_PER_INST]
+            print(f"[xm] сэмплов {len(used)} > {MAX_XM_INSTRUMENTS}: упаковываю по несколько в инструмент "
+                  f"(до {MAX_XM_SAMPLES_PER_INST}, раскладка по диапазонам нот)")
         # порядок инструментов - по первому появлению
         first = {}
         for n in notes:
@@ -734,9 +795,23 @@ def convert(args):
                 mid = (lo + hi) / 2
                 fold = int(round((mid - 48.5) / 12.0))
             s.fold = fold
+            s.shift = 12 * fold
+            s.lo, s.hi = lo, hi
             # XM: rate(cell) = 8363 * 2^((cell-49+tune)/12) должен равняться ref_rate * ratio
             ref = args.ref_rate if args.ref_rate else rate
-            s.tune = 12.0 * math.log2(ref / XM_C4_RATE) - s.m1 - total_shift + 12 * fold
+            s.tune = 12.0 * math.log2(ref / XM_C4_RATE) - s.m1 - total_shift + s.shift
+
+        # ── раскладка сэмплов по инструментам XM ──
+        ref = args.ref_rate if args.ref_rate else rate
+        groups = pack_samples(samples, ref, total_shift) if pack else [[s] for s in
+                                                                      sorted(samples.values(), key=lambda s: s.index)]
+        for gi, g in enumerate(groups, 1):
+            for si, s in enumerate(g):
+                s.inst, s.sub = gi, si
+        kept = {id(s) for g in groups for s in g}
+        if len(kept) != len(samples):                    # не поместились в 128 инструментов
+            samples = {h: s for h, s in samples.items() if id(s) in kept}
+            notes = [n for n in notes if id(n.sample) in kept]
 
         # ── громкость ──
         peaks = np.array([n.peak * n.sample.peak / 32768.0 for n in notes])
@@ -808,12 +883,12 @@ def convert(args):
                         fr = int(round(np.searchsorted(frame_times, t)))
                         return max(0, min(len(n.frames) - 1, fr - n.start_frame))
 
-                    f0 = cell_float(n, 0, s, total_shift - 12 * s.fold)
+                    f0 = cell_float(n, 0, s, total_shift - s.shift)
                     cur_cell = int(round(f0))
                     cur_cell = max(1, min(96, cur_cell))
                     c0 = put(n.start_row)
                     c0.note = cur_cell
-                    c0.inst = s.index
+                    c0.inst = s.inst
                     ci = next(i for i, l in enumerate(n.level) if l >= 0.5 * n.peak)
                     last_vol = vol_at(idx_at(n.start_row))
                     c0.vol = 0x10 + last_vol
@@ -824,7 +899,7 @@ def convert(args):
                     for row in range(n.start_row + 1, end_row):
                         i = idx_at(row)
                         v = vol_at(i)
-                        pf = cell_float(n, i, s, total_shift - 12 * s.fold)
+                        pf = cell_float(n, i, s, total_shift - s.shift)
                         c = None
                         if abs(v - last_vol) >= max(2, int(0.08 * last_vol)):
                             c = put(row)
@@ -858,15 +933,27 @@ def convert(args):
                         break
             xm = XMWriter(title, nch, start_bpm, speed, tracker='USF2XM Converter')
             xm.set_rows(grid, last_row + 2)
-            for h, s in sorted(samples.items(), key=lambda kv: kv[1].index):
-                data = s.data.astype(np.float64) * (32767.0 / s.peak)
-                data = np.clip(np.round(data), -32768, 32767).astype(np.int16)
-                rel = int(round(s.tune))
-                rel = max(-96, min(95, rel))
-                fine = int(round((s.tune - rel) * 128))
-                fine = max(-128, min(127, fine))
-                nm = f"S{s.index:02d} {s.hash:08x}"
-                xm.instruments.append(XmInstrument.simple(nm, data, s.loop, rel, fine))
+            for g in groups:
+                xs = []
+                for s in g:
+                    data = s.data.astype(np.float64) * (32767.0 / s.peak)
+                    data = np.clip(np.round(data), -32768, 32767).astype(np.int16)
+                    rel = int(round(s.tune))
+                    rel = max(-96, min(95, rel))
+                    fine = int(round((s.tune - rel) * 128))
+                    fine = max(-128, min(127, fine))
+                    ls, ll = s.loop if s.loop else (0, 0)
+                    xs.append(XmSample(data, f"S{s.index:02d} {s.hash:08x}", ls, ll,
+                                       finetune=fine, relative_note=rel))
+                if len(g) == 1:
+                    xm.instruments.append(XmInstrument(xs[0].name, xs))
+                else:
+                    km = [0] * 96
+                    for s in g:
+                        a, w = s.win
+                        for c in range(a, a + w):
+                            km[c - 1] = s.sub
+                    xm.instruments.append(XmInstrument(f"G{g[0].inst:02d} x{len(g)}", xs, keymap=km))
             xm_path = base + '.xm'
             xm.write(xm_path)
             print(f"[xm] {xm_path}  ({len(xm.patterns)} паттернов, "

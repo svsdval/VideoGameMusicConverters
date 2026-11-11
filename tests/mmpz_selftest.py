@@ -75,6 +75,20 @@ def write_xm(path, bits8=False, pingpong=False):
         f.write(d.tobytes())
 
 
+
+def write_multi_xm(path):
+    """Один инструмент XM с двумя сэмплами (петли 37 и 50 кадров), выбор по номеру ноты: 1..48 -> первый,
+    49..96 -> второй, у каждого свой relative note. Две ноты: 40 (первый сэмпл) и 60 (второй)."""
+    import xm_export as XE
+    a = np.round(20000 * np.sin(2 * np.pi * np.arange(37) / 37.0)).astype(np.int16)
+    b = np.round(20000 * np.sin(2 * np.pi * np.arange(50) / 50.0)).astype(np.int16)
+    inst = XE.XmInstrument('multi', [XE.XmSample(a, 'A', 0, 37, relative_note=2),
+                                     XE.XmSample(b, 'B', 0, 50, relative_note=-5)],
+                           keymap=[0] * 48 + [1] * 48)
+    grid = {(0, 0): XE.Cell(40, 1, 0x50), (16, 0): XE.Cell(60, 1, 0x50), (30, 0): XE.Cell(97)}
+    XE.write_xm(path, 't', 't', 2, 125, 6, XE.grid_to_patterns(grid, 64, 2, 64), [inst])
+
+
 def f0(seg, sr):
     seg = seg - seg.mean()
     n = 1 << 18
@@ -154,6 +168,24 @@ def main():
             f = f0(d2[int(1 * ROW * sr):int(7 * ROW * sr)], sr)
             e = expect_freq(49, 2 * LOOP - 2)
             check('пинг-понг: частота C-4', abs(f / e - 1) < 0.004, '%.2f Гц, ожидалось %.2f' % (f, e))
+        # инструмент с несколькими сэмплами и keymap (так упаковываются инструменты, когда сэмплов > 128)
+        xm3 = os.path.join(work, 'm.xm')
+        write_multi_xm(xm3)
+        n3, _, _ = M.build_notes(M.read_xm(xm3))
+        check('multi: ноты выбирают сэмпл по keymap', sorted(n.inst for n in n3) == [(1, 0), (1, 1)], str([n.inst for n in n3]))
+        if lmms:
+            out3 = os.path.join(work, 'm.mmpz')
+            M.convert_file(xm3, out3, log=lambda m: None)
+            wav3 = os.path.join(work, 'm.wav')
+            subprocess.run([lmms, '-r', out3, '-f', 'wav', '-o', wav3], env=env, capture_output=True, timeout=300)
+            w = wave.open(wav3)
+            d3 = np.frombuffer(w.readframes(w.getnframes()), '<i2').reshape(-1, w.getnchannels()).mean(1)
+            fa = f0(d3[int(1 * ROW * sr):int(14 * ROW * sr)], sr)
+            fb = f0(d3[int(17 * ROW * sr):int(29 * ROW * sr)], sr)
+            ea = M.XM_C4_RATE * 2.0 ** ((40 - 49 + 2) / 12.0) / 37
+            eb = M.XM_C4_RATE * 2.0 ** ((60 - 49 - 5) / 12.0) / 50
+            check('multi: частота первого сэмпла', abs(fa / ea - 1) < 0.004, '%.2f Гц, ожидалось %.2f' % (fa, ea))
+            check('multi: частота второго сэмпла', abs(fb / eb - 1) < 0.004, '%.2f Гц, ожидалось %.2f' % (fb, eb))
     finally:
         shutil.rmtree(work, ignore_errors=True)
     print('ИТОГ:', 'все проверки пройдены' if not fails else 'ПРОВАЛЕНО: ' + ', '.join(fails))
