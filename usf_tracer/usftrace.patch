@@ -103,7 +103,7 @@ index 903268e..9642fcb 100644
 +            h = v->hash;
 +            {
 +                struct usf_cov *c = usf_cov_get(h);
-+                if (cum + cnt > c->len && c->len < 262144) {
++                if (cum + cnt > c->len && c->len < 16777216) {
 +                    off = ftell(usf_trace_pcm);
 +                    for (i = 0; i < cnt/2; i++) { int16_t x = alist_trace_s16(hle, ib + i*2); fwrite(&x, 2, 1, usf_trace_pcm); }
 +                    c->len = cum + cnt;
@@ -157,7 +157,7 @@ index 903268e..9642fcb 100644
 +        h = v->hash;
 +        {
 +            struct usf_cov *c = usf_cov_get(h);
-+            if (cum + cnt > c->len && c->len < 262144) {
++            if (cum + cnt > c->len && c->len < 16777216) {
 +                unsigned i;
 +                off = ftell(usf_trace_pcm);
 +                for (i = 0; i < cnt/2; i++) { int16_t x = alist_trace_s16(hle, ob + i*2); fwrite(&x, 2, 1, usf_trace_pcm); }
@@ -322,7 +322,7 @@ index d5a630a..bdee40d 100644
 +                }
 +                h = tv->hash;
 +                cv = usf_cov_get(h);
-+                if (tv->cum + (long)cnt > cv->len && cv->len < 262144) {
++                if (tv->cum + (long)cnt > cv->len && cv->len < 16777216) {
 +                    off = ftell(usf_trace_pcm);
 +                    fwrite(tr_run, 2, tr_n, usf_trace_pcm);
 +                    cv->len = tv->cum + cnt;

@@ -3177,7 +3177,7 @@ class AlistExtra:
             v[1] = h
             v[2] = 1
         h = v[1]
-        if cum + cnt > self.cov_len(h) and self.cov_len(h) < 262144:
+        if cum + cnt > self.cov_len(h) and self.cov_len(h) < 16777216:
             off = self.pcm_write_samples(ob, cnt // 2)
             self.cov[h] = cum + cnt
         self.t.append('A %u %u %u %u %x %x %x %d %d %u\n' % (
@@ -3211,7 +3211,7 @@ class AlistExtra:
                 v[1] = h
                 v[2] = 1
             h = v[1]
-            if cum + cnt > self.cov_len(h) and self.cov_len(h) < 262144:
+            if cum + cnt > self.cov_len(h) and self.cov_len(h) < 16777216:
                 off = self.pcm_write_samples(ib, cnt // 2)
                 self.cov[h] = cum + cnt
             self.t.append('A %u %u %u %u %x %x %x %d %d %u\n' % (flags & A_INIT, ib, 0, cnt, vaddr, 0, h, cum, off, 1))
@@ -3778,7 +3778,7 @@ class MusyxMixin:
                     h = (h * 16777619) & M32
                 tv[1] = h
             h = tv[1]
-            if tv[0] + cnt > self.cov_len(h) and self.cov_len(h) < 262144:
+            if tv[0] + cnt > self.cov_len(h) and self.cov_len(h) < 16777216:
                 off = len(self.pcm)
                 self.pcm += np.array(run, dtype='<i2').tobytes()
                 self.cov[h] = tv[0] + cnt
@@ -4283,7 +4283,7 @@ class Hle(AlistExtra, MusyxMixin):
                     v[1] = h
                     v[2] = 1
                 h = v[1]
-                if cum + cnt > self.cov_len(h) and self.cov_len(h) < 262144:
+                if cum + cnt > self.cov_len(h) and self.cov_len(h) < 16777216:
                     off = self.pcm_write_samples(ib, cnt // 2)
                     self.cov[h] = cum + cnt
                 self.t.append('A %u %u %u %u %x %x %x %d %d %u\n' % (flags & A_INIT, ib, 0, cnt, vaddr, 0, h, cum, off, 1))
@@ -4373,7 +4373,7 @@ class Hle(AlistExtra, MusyxMixin):
                 v[1] = h
                 v[2] = 1
             h = v[1]
-            if cum + cnt > self.cov_len(h) and self.cov_len(h) < 262144:
+            if cum + cnt > self.cov_len(h) and self.cov_len(h) < 16777216:
                 off = self.pcm_write_samples(ob, cnt // 2)
                 self.cov[h] = cum + cnt
             self.t.append('A %u %u %u %u %x %x %x %d %d %u\n' % (
