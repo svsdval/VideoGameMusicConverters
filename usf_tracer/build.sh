@@ -17,6 +17,8 @@ fi
 grep -q vi_without_audio usf/usf_internal.h || git apply "$HERE/silence.patch"
 # игра ждёт прерывание DP после пропущенной графической задачи, иначе её планировщик встаёт
 grep -q MI_INTR_DP rsp_hle/hle.c || git apply "$HERE/gfxdone.patch"
+# ENVMIXER_GE (GoldenEye, Blast Corps) тоже пишет строки E, иначе голосов в логе нет
+grep -c '"E %u' rsp_hle/alist_audio.c | grep -qx 2 || git apply "$HERE/envmixge.patch"
 rm -f test/*.o        # в репозитории лежат устаревшие объектные файлы
 make -j"$(nproc)" liblazyusf.a
 make usftrace

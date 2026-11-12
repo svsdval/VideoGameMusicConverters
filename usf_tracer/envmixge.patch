@@ -1,0 +1,24 @@
+--- a/rsp_hle/alist_audio.c
++++ b/rsp_hle/alist_audio.c
+@@ -121,6 +121,21 @@
+             hle->alist_audio.target,
+             hle->alist_audio.rate,
+             address);
++
++    usf_adpcm_seen = 0;
++    usf_adpcm_init = 0;
++    usf_last_load_cnt = 0;
++    if (usf_trace_f) {
++        /* тот же формат строки E, что и у ENVMIXER (раскладка буфера состояния одинакова) */
++        short sb[40];
++        memcpy(sb, hle->dram + address, sizeof(sb));
++        fprintf(usf_trace_f, "E %u %u %u %u %d %d %d %d %d %d %d %d %x\n", flags, hle->alist_audio.in, hle->alist_audio.out,
++                hle->alist_audio.count,
++                (int)(*(int32_t *)(sb + 16) >> 16), (int)(*(int32_t *)(sb + 18) >> 16),
++                (int)(*(int32_t *)(sb + 4) >> 16), (int)(*(int32_t *)(sb + 6) >> 16),
++                (int)*(int32_t *)(sb + 8), (int)*(int32_t *)(sb + 10),
++                (int)*(int16_t *)(sb + 2), (int)*(int16_t *)(sb + 0), address);
++    }
+ }
+ 
+ static void RESAMPLE(struct hle_t* hle, uint32_t w1, uint32_t w2)

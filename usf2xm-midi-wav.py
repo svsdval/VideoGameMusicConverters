@@ -26,6 +26,7 @@ MusyX v1/v2 (007 TWINE, Rogue Squadron, Indiana Jones, ...). ABI1 и MusyX ум�
 """
 
 import argparse
+import bisect
 import collections
 import math
 import os
@@ -880,7 +881,7 @@ def convert(args):
                     # индекс кадра ноты для времени строки
                     def idx_at(row):
                         t = row_t0 + row * delta
-                        fr = int(round(np.searchsorted(frame_times, t)))
+                        fr = bisect.bisect_left(frame_times, t)
                         return max(0, min(len(n.frames) - 1, fr - n.start_frame))
 
                     f0 = cell_float(n, 0, s, total_shift - s.shift)
