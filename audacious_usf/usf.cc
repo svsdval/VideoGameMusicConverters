@@ -168,8 +168,9 @@ bool load_usf(const char * filename, Loaded & L, bool need_state)
         L.state = malloc(usf_get_state_size());
         usf_clear(L.state);
     }
-    int ver = psf_load(path, &cbs, 0x21, need_state ? loader : nullptr, &L, info_cb, &L,
-                       need_state ? 0 : 1, msg_cb, nullptr);
+    // nested_tags=1 и при загрузке состояния: флаги _enablefifofull/_enablecompare лежат в .usflib,
+    // без них некоторые игры (Blast Corps) зависают в эмуляции и Audacious вечно «буферизует»
+    int ver = psf_load(path, &cbs, 0x21, need_state ? loader : nullptr, &L, info_cb, &L, 1, msg_cb, nullptr);
     if (ver <= 0)
     {
         if (L.state) { free(L.state); L.state = nullptr; }
