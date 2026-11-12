@@ -217,8 +217,9 @@ def _write_instrument(f, inst):
     return fixed
 
 
-def write_xm(path, title, tracker, nch, bpm, speed, patterns, instruments, order=None):
-    """patterns - список паттернов (строки из ячеек Cell/None); instruments - список XmInstrument."""
+def write_xm(path, title, tracker, nch, bpm, speed, patterns, instruments, order=None, linear=True):
+    """patterns - список паттернов (строки из ячеек Cell/None); instruments - список XmInstrument.
+    linear=False - таблица частот Amiga (флаг 0): так вибрато и слайды 1xx/2xx/3xx звучат как в MOD."""
     order = list(order) if order is not None else list(range(len(patterns)))
     instruments = instruments[:MAX_XM_INSTRUMENTS]
     with open(path, 'wb') as f:
@@ -227,7 +228,7 @@ def write_xm(path, title, tracker, nch, bpm, speed, patterns, instruments, order
         f.write(b'\x1a')
         f.write(tracker.encode('ascii', 'replace')[:20].ljust(20, b' '))
         f.write(struct.pack('<HI', 0x0104, 276))
-        f.write(struct.pack('<HHHHHHHH', len(order), 0, nch, len(patterns), len(instruments), 1, speed, bpm))
+        f.write(struct.pack('<HHHHHHHH', len(order), 0, nch, len(patterns), len(instruments), 1 if linear else 0, speed, bpm))
         ot = bytearray(256)
         for i, o in enumerate(order[:256]):
             ot[i] = o

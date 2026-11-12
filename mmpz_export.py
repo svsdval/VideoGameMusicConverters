@@ -74,6 +74,7 @@ class XmModule:
         self.instruments = {}         # номер (с 1) -> (имя, первый XmSample)
         self.samples = {}             # (номер инструмента, номер сэмпла в нём) -> (имя, XmSample)
         self.keymaps = {}             # номер инструмента -> 96 номеров сэмплов по нотам
+        self.linear = True            # флаг заголовка: линейная таблица частот (иначе периоды Amiga)
 
 
 def _unpack_pattern(raw, nrows, nch):
@@ -120,6 +121,7 @@ def read_xm(path):
     hsize = struct.unpack_from('<I', d, 60)[0]
     songlen, _restart, nch, npat, ninst, _flags, speed, bpm = struct.unpack_from('<8H', d, 64)
     xm.nch, xm.speed, xm.bpm = nch, speed or 6, bpm or 125
+    xm.linear = bool(_flags & 1)
     xm.order = list(d[80:80 + 256])[:songlen]
     p = 60 + hsize
     for _ in range(npat):
@@ -190,8 +192,157 @@ class Note:
         self.t1 = None
         self.vol = [(t, vol)]         # (время, 0..64)
         self.pan = [(t, pan)]         # (время, 0..255)
-        self.bends = []               # (время, ключ XM)
+        self.bends = []               # (время, смещение высоты в полутонах от ключа ноты)
         self.lane = 0
+
+
+def iter_rows(xm):
+    """Строки в порядке воспроизведения с учётом Bxx (прыжок), Dxx (конец паттерна), E6x (петля) и
+    EEx (задержка паттерна). Конец - когда позиция повторяется (песня зациклилась) или порядок кончился.
+    -> (строка, число повторов строки)."""
+    pos, row_i = 0, 0
+    seen = set()
+    loop_start = {}
+    loop_cnt = {}
+    guard = 0
+    while pos < len(xm.order) and guard < 200000:
+        guard += 1
+        o = xm.order[pos]
+        if o >= len(xm.patterns):
+            pos += 1
+            row_i = 0
+            continue
+        pat = xm.patterns[o]
+        if row_i >= len(pat):
+            pos, row_i = pos + 1, 0
+            continue
+        row = pat[row_i]
+        jump_pos = jump_row = None
+        loop_to = None
+        repeat = 1
+        for ch, c in enumerate(row):
+            eff, par = c[3], c[4]
+            if eff == 0x0B:
+                jump_pos, jump_row = par, 0
+            elif eff == 0x0D:
+                jump_row = (par >> 4) * 10 + (par & 15)
+                if jump_pos is None:
+                    jump_pos = pos + 1
+            elif eff == 0x0E and (par >> 4) == 6:
+                x = par & 15
+                if x == 0:
+                    loop_start[ch] = row_i
+                elif loop_cnt.get(ch, 0) < x and ch in loop_start or (x and ch not in loop_start and loop_cnt.get(ch, 0) < x):
+                    loop_cnt[ch] = loop_cnt.get(ch, 0) + 1
+                    loop_to = loop_start.get(ch, 0)
+                else:
+                    loop_cnt[ch] = 0
+            elif eff == 0x0E and (par >> 4) == 0x0E:
+                repeat = 1 + (par & 15)
+        key = (pos, row_i, tuple(sorted(loop_cnt.items())))
+        if key in seen:
+            return
+        seen.add(key)
+        yield row, repeat
+        if loop_to is not None:
+            row_i = loop_to
+        elif jump_pos is not None:
+            pos, row_i = jump_pos, jump_row or 0
+            if pos >= len(xm.order):
+                return
+        else:
+            row_i += 1
+
+
+def _offset_sample(xm, key, off):
+    """Сэмпл key, начиная с кадра off (эффект 9xx). Новый сэмпл кладётся в xm.samples под ключом key+(off,).
+    None - смещение за концом сэмпла (нота не звучит)."""
+    nk = key + (off,)
+    if nk in xm.samples:
+        return nk
+    name, smp = xm.samples[key]
+    if off >= len(smp.data):
+        return None
+    ns = XmSample()
+    ns.name = '%s @%d' % (name, off)
+    ns.data = smp.data[off:]
+    ns.volume, ns.finetune, ns.pan, ns.rel = smp.volume, smp.finetune, smp.pan, smp.rel
+    ns.loop_type = smp.loop_type
+    if smp.loop_type in (1, 2) and smp.loop_len >= 2:
+        end = smp.loop_start + smp.loop_len
+        if off >= end:
+            ns.loop_type = 0                      # старт за петлёй: играет хвост без петли
+        else:
+            ns.loop_start = max(0, smp.loop_start - off)
+            ns.loop_len = end - off - ns.loop_start
+    xm.samples[nk] = (ns.name, ns)
+    return nk
+
+
+def _pitch_row(xm, cur, ch, eff, par, t, tick_t, speed, pit, tgt, pmem, vib):
+    """Высота ноты в течение строки: 1xx/2xx/E1x/E2x (слайды), 3xx/5xy (портаменто к ноте), 4xy/6xy (вибрато),
+    0xy (арпеджио). Точки (время, полутона от ключа ноты) добавляются в cur.bends по одной на тик XM.
+    Периоды Amiga (MOD): шаг слайда - в единицах периода; линейная таблица XM: 1/16 полутона."""
+    amiga = not xm.linear
+    pref = 428.0 * 2.0 ** ((49 - cur.key) / 12.0)          # период ключа ноты (C-4 = 428)
+
+    def slide(sem, d):                                      # d > 0 - вверх по высоте
+        if amiga:
+            p = pref * 2.0 ** (-sem / 12.0)
+            p = max(54.0, min(1712.0, p - d))
+            return 12.0 * math.log2(pref / p)
+        return sem + d / 16.0
+
+    def vibrato_sem(sem, x, depth, pos):
+        w = math.sin(2.0 * math.pi * (pos & 63) / 64.0) * 255.0 * depth
+        if amiga:
+            p = pref * 2.0 ** (-sem / 12.0)
+            return -12.0 * math.log2((p + w / 128.0) / p) if p + w / 128.0 > 1 else 0.0
+        return -w / 32.0 / 64.0
+
+    pm, vb = pmem[ch], vib[ch]
+    slide_vol_only = eff in (0x05, 0x06)
+    if eff == 0x01 and par:
+        pm[0] = par
+    if eff == 0x02 and par:
+        pm[1] = par
+    if eff == 0x03 and par:
+        pm[2] = par
+    if eff == 0x04:
+        if par >> 4:
+            vb[0] = par >> 4
+        if par & 15:
+            vb[1] = par & 15
+    arp = (par >> 4, par & 15) if eff == 0 else None
+    if eff == 0x0E:
+        d = (par & 15) * (1 if (par >> 4) == 1 else -1)
+        pit[ch] = slide(pit[ch], d)
+    last = cur.bends[-1][1] if cur.bends else 0.0
+    for k in range(speed):
+        if k >= 1:
+            if eff == 0x01:
+                pit[ch] = slide(pit[ch], pm[0])
+            elif eff == 0x02:
+                pit[ch] = slide(pit[ch], -pm[1])
+            elif eff in (0x03, 0x05) and tgt[ch] is not None and pm[2]:
+                cur_sem = pit[ch]
+                nxt = slide(cur_sem, pm[2] if tgt[ch] > cur_sem else -pm[2])
+                if (tgt[ch] - cur_sem) * (tgt[ch] - nxt) <= 0:
+                    nxt = tgt[ch]
+                    tgt[ch] = None
+                pit[ch] = nxt
+        v = pit[ch]
+        if eff in (0x04, 0x06) and k >= 1:                  # вибрато: на нулевом тике ни смещения, ни шага фазы
+            v += vibrato_sem(pit[ch], vb[0], vb[1], vb[2])
+            vb[2] += vb[0]
+        elif arp is not None:
+            v += (0, arp[0], arp[1])[k % 3]
+        v = max(-48.0, min(48.0, v))
+        if abs(v - last) >= 0.03:
+            cur.bends.append((t + k * tick_t, round(v, 3)))
+            last = v
+    if eff not in (0x04, 0x06) and arp is None and abs(pit[ch] - last) >= 0.03:
+        cur.bends.append((t + (speed - 1) * tick_t, round(pit[ch], 3)))
 
 
 def build_notes(xm):
@@ -202,20 +353,28 @@ def build_notes(xm):
     last_inst = [0] * xm.nch
     chan_vol = [64] * xm.nch
     chan_pan = [128] * xm.nch
+    last_off = [0] * xm.nch
+    slide_mem = [0] * xm.nch
+    pit = [0.0] * xm.nch              # накопленное смещение высоты канала (полутона от ключа ноты)
+    tgt = [None] * xm.nch             # цель портаменто 3xx (полутона от ключа ноты)
+    pmem = [[0, 0, 0] for _ in range(xm.nch)]    # память: 1xx, 2xx, 3xx
+    vib = [[0, 0, 0] for _ in range(xm.nch)]     # вибрато: скорость, глубина, фаза
     notes = []
     min_row = None
-    for o in xm.order:
-        if o >= len(xm.patterns):
-            continue
-        for row in xm.patterns[o]:
+    for row, repeat in iter_rows(xm):
+        if True:
             for c in row:
                 if c[3] == 0x0F and c[4]:
                     if c[4] < 32:
                         speed = c[4]
                     else:
                         bpm = c[4]
+            tick_t = 2.5 / bpm                            # длительность одного тика XM
             for ch, (note, inst, vcol, eff, par) in enumerate(row):
                 porta = (eff == 3)
+                tn = t
+                if eff == 0x0E and (par >> 4) == 0x0D and (par & 15) < speed:
+                    tn = t + (par & 15) * tick_t          # EDx: нота стартует через x тиков
                 if inst:
                     last_inst[ch] = inst
                 if note == 97:
@@ -229,12 +388,17 @@ def build_notes(xm):
                     key = (last_inst[ch], xm.keymaps[last_inst[ch]][note - 1] if last_inst[ch] in xm.keymaps else 0)
                     if key not in xm.samples:
                         ins = None
+                    elif eff == 0x09 and (par or last_off[ch]):          # 9xx: старт с позиции par*256 кадров
+                        if par:
+                            last_off[ch] = par
+                        key = _offset_sample(xm, key, last_off[ch] * 256)
+                        if key is None:
+                            ins = None
                     if porta and cur is not None:
-                        if not cur.bends or cur.bends[-1][1] != note:
-                            cur.bends.append((t, note))
+                        tgt[ch] = float(note - cur.key)
                     elif ins is not None:
                         if cur is not None:
-                            cur.t1 = t
+                            cur.t1 = tn
                         smp = xm.samples[key][1]
                         if inst:
                             chan_vol[ch] = smp.volume
@@ -245,7 +409,10 @@ def build_notes(xm):
                             chan_pan[ch] = par
                         if eff == 0x0C:
                             chan_vol[ch] = min(64, par)
-                        n = Note(key, note, t, chan_vol[ch], chan_pan[ch])
+                        if eff == 0x0E and (par >> 4) in (0x0A, 0x0B):
+                            chan_vol[ch] = max(0, min(64, chan_vol[ch] + (par & 15) * (1 if par >> 4 == 0x0A else -1)))
+                        n = Note(key, note, tn, chan_vol[ch], chan_pan[ch])
+                        pit[ch], tgt[ch], vib[ch][2] = 0.0, None, 0
                         chan[ch] = n
                         notes.append(n)
                         continue
@@ -258,11 +425,40 @@ def build_notes(xm):
                     chan_vol[ch] = min(64, par)
                     if cur is not None:
                         cur.vol.append((t, chan_vol[ch]))
+                if eff == 0x0E and (par >> 4) in (0x0A, 0x0B):
+                    chan_vol[ch] = max(0, min(64, chan_vol[ch] + (par & 15) * (1 if par >> 4 == 0x0A else -1)))
+                    if cur is not None:
+                        cur.vol.append((t, chan_vol[ch]))
                 if eff == 0x08:
                     chan_pan[ch] = par
                     if cur is not None:
                         cur.pan.append((t, par))
-            dur = speed * 2.5 / bpm
+            for ch, (note, inst, vcol, eff, par) in enumerate(row):
+                cur = chan[ch]
+                if cur is None:
+                    continue
+                if eff == 0x0E and (par >> 4) == 0x0C and (par & 15) < speed:
+                    cur.t1 = t + (par & 15) * tick_t                # ECx: обрыв через x тиков
+                    chan[ch] = None
+                if eff in (0x01, 0x02, 0x03, 0x04, 0x05, 0x06) or (eff == 0 and par) or \
+                        (eff == 0x0E and (par >> 4) in (1, 2)):
+                    _pitch_row(xm, cur, ch, eff, par, t, tick_t, speed, pit, tgt, pmem, vib)
+                elif cur.bends and abs(cur.bends[-1][1] - pit[ch]) >= 0.03:
+                    cur.bends.append((t, round(pit[ch], 3)))      # вибрато/арпеджио кончились - вернуть высоту
+                if eff in (0x05, 0x06, 0x0A):
+                    # Axy, 5xy, 6xy: плавное изменение громкости по тикам (параметр 00 - как в прошлый раз)
+                    if par:
+                        slide_mem[ch] = par
+                    par = slide_mem[ch]
+                    if not par:
+                        continue
+                    d = (par >> 4) - (par & 15)
+                    v = chan_vol[ch]
+                    for k in range(1, speed):
+                        v = max(0, min(64, v + d))
+                        cur.vol.append((t + k * tick_t, v))
+                    chan_vol[ch] = v
+            dur = speed * 2.5 / bpm * repeat
             if min_row is None or dur < min_row:
                 min_row = dur
             t += dur
@@ -434,17 +630,14 @@ def xm_to_project(xm, out_path, embed=False, bpm=None, samples_dir=None, gain=No
     # длительности строк для выбора BPM
     row_times = []
     speed, cur_bpm = xm.speed, xm.bpm
-    for o in xm.order:
-        if o >= len(xm.patterns):
-            continue
-        for row in xm.patterns[o]:
-            for c in row:
-                if c[3] == 0x0F and c[4]:
-                    if c[4] < 32:
-                        speed = c[4]
-                    else:
-                        cur_bpm = c[4]
-            row_times.append(speed * 2.5 / cur_bpm)
+    for row, repeat in iter_rows(xm):
+        for c in row:
+            if c[3] == 0x0F and c[4]:
+                if c[4] < 32:
+                    speed = c[4]
+                else:
+                    cur_bpm = c[4]
+        row_times.append(speed * 2.5 / cur_bpm * repeat)
     bpm = int(bpm) if bpm else choose_bpm(row_times, min_row)
     tau = 60.0 / (bpm * TICKS_PER_BEAT)                   # длительность тика, с
 
@@ -532,12 +725,12 @@ def xm_to_project(xm, out_path, embed=False, bpm=None, samples_dir=None, gain=No
                     pts = [(0, 0)]
                     for t, k in n.bends:
                         rel = max(1, min(n.k1 - n.k0 - 1, tick(t) - n.k0)) if n.k1 - n.k0 > 1 else 1
-                        pts.append((rel, max(-48, min(48, k - n.key))))
+                        pts.append((rel, max(-48.0, min(48.0, k))))
                     pts = _compress_points(pts)
                     if len(pts) > 1:
                         det = ('<automationpattern><detuning pos="0" len="%d" name="" prog="0" tens="1" mute="0">'
                                % (n.k1 - n.k0)
-                               + ''.join('<time pos="%d" value="%d"/>' % p for p in pts)
+                               + ''.join('<time pos="%d" value="%.3f"/>' % p for p in pts)
                                + '</detuning></automationpattern>')
                 nx.append('<note pan="0" len="%d" key="%d" vol="100" pos="%d">%s</note>' % (n.k1 - n.k0, key, n.k0, det))
             nframes = len(s.data)
